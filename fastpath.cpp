@@ -335,7 +335,15 @@ static void img_u8_to_f32_lut_axpby_avx2(
       __m256 vax  = _mm256_mul_ps(valpha, vdst);
       __m256 vbt  = _mm256_mul_ps(vbeta,  vtmp);
       __m256 vout = _mm256_add_ps(vax, vbt);
-      _mm256_storeu_ps(drow + x, vout);
+      if (g_streaming_enabled && is_aligned_32(drow + x) && (width >= 1024)) {
+        _mm256_stream_ps(drow + x, vout);
+      } else {
+        _mm256_storeu_ps(drow + x, vout);
+      }
+    }
+
+    if (g_streaming_enabled && width >= 1024) {
+      _mm_sfence();
     }
 
     // Rest
