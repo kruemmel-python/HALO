@@ -307,6 +307,7 @@ static void img_u8_to_f32_lut_axpby_avx2(
     int x = 0;
 
     // 8-Pixel-Block
+    bool used_streaming = false;
     for (; x + 8 <= width; x += 8) {
       // Lade 8 U8
       // Wir laden 8 Bytes in ein 64-Bit-Register
@@ -335,13 +336,22 @@ static void img_u8_to_f32_lut_axpby_avx2(
       __m256 vax  = _mm256_mul_ps(valpha, vdst);
       __m256 vbt  = _mm256_mul_ps(vbeta,  vtmp);
       __m256 vout = _mm256_add_ps(vax, vbt);
-      _mm256_storeu_ps(drow + x, vout);
+      if (g_streaming_enabled && width >= 1024 && is_aligned_32(drow + x)) {
+        _mm256_stream_ps(drow + x, vout);
+        used_streaming = true;
+      } else {
+        _mm256_storeu_ps(drow + x, vout);
+      }
     }
 
     // Rest
     for (; x < width; ++x) {
       float tmp = lut256[(int)srow[x]] * scale + offset;
       drow[x] = alpha * drow[x] + beta * tmp;
+    }
+
+    if (used_streaming) {
+      _mm_sfence();
     }
   }
 }
