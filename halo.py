@@ -4,12 +4,20 @@
 
 from __future__ import annotations
 import ctypes as C
+import ctypes.util
 import json, os, platform, atexit
 from pathlib import Path
 from typing import Union, Sequence, Tuple
 from array import array
 
-__all__ = ["HALO", "Impl", "make_identity_lut"]
+__all__ = [
+    "HALO",
+    "Impl",
+    "make_identity_lut",
+    "allocate_aligned_bytes",
+    "allocate_aligned_f32",
+    "pin_memory",
+]
 
 # ---------------- Laden der DLL/.so ----------------
 def _load_lib() -> C.CDLL:
@@ -58,6 +66,92 @@ _lib.halo_img_u8_to_f32_lut_axpby.argtypes = [
 ]
 _lib.halo_img_u8_to_f32_lut_axpby.restype = C.c_int
 
+_lib.halo_img_u16_to_f32_axpby.argtypes = [
+    C.POINTER(C.c_ushort), C.c_longlong,
+    C.POINTER(C.c_float),  C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int,
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_int
+]
+_lib.halo_img_u16_to_f32_axpby.restype = C.c_int
+
+_lib.halo_img_rgb_u8_to_f32_interleaved.argtypes = [
+    C.POINTER(C.c_ubyte), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_int
+]
+_lib.halo_img_rgb_u8_to_f32_interleaved.restype = C.c_int
+
+_lib.halo_img_rgb_u8_to_f32_planar.argtypes = [
+    C.POINTER(C.c_ubyte), C.c_longlong,
+    C.POINTER(C.c_ubyte), C.c_longlong,
+    C.POINTER(C.c_ubyte), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_int
+]
+_lib.halo_img_rgb_u8_to_f32_planar.restype = C.c_int
+
+_lib.halo_img_box_blur_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int,
+    C.c_int
+]
+_lib.halo_img_box_blur_f32.restype = C.c_int
+
+_lib.halo_img_gauss_blur_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int,
+    C.c_float,
+    C.c_int
+]
+_lib.halo_img_gauss_blur_f32.restype = C.c_int
+
+_lib.halo_img_sobel_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_img_sobel_f32.restype = C.c_int
+
+_lib.halo_img_resize_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int,
+    C.c_int
+]
+_lib.halo_img_resize_f32.restype = C.c_int
+
+_lib.halo_img_relu_clamp_axpby_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_int,
+    C.c_int
+]
+_lib.halo_img_relu_clamp_axpby_f32.restype = C.c_int
+
 # Optional: Pool-Shutdown wenn vorhanden (v0.5b+)
 try:
     _lib.halo_shutdown_pool.restype = None
@@ -82,6 +176,7 @@ def _write_profile(d: dict) -> None:
 # ---------------- Typen & Helfer ----------------
 ArrayLikeFloat = Union[array, memoryview]
 ArrayLikeU8    = Union[bytes, bytearray, memoryview]
+ArrayLikeU16   = Union[array, bytearray, memoryview]
 
 def _to_c_float_ptr(buf: ArrayLikeFloat) -> Tuple[C.POINTER(C.c_float), int]:
     match buf:
@@ -143,6 +238,78 @@ def _to_c_lut_ptr(lut: Union[Sequence[float], array, memoryview]) -> C.POINTER(C
 
 def make_identity_lut() -> array:
     return array('f', [float(i) for i in range(256)])
+
+def _to_c_u16_ptr_2d(buf: ArrayLikeU16, width: int, height: int, stride_bytes: int) -> C.POINTER(C.c_ushort):
+    if isinstance(buf, array) and buf.typecode == 'H':
+        mv = memoryview(buf)
+    elif isinstance(buf, bytearray):
+        mv = memoryview(buf)
+    elif isinstance(buf, memoryview):
+        mv = buf
+    else:
+        raise TypeError("src erwartet array('H'), bytearray oder memoryview('H').")
+    if mv.readonly:
+        raise ValueError("src darf nicht read-only sein.")
+    if mv.itemsize not in (1, 2):
+        raise TypeError("src muss 1- oder 2-Byte-Elemente haben.")
+    if not mv.contiguous:
+        raise TypeError("src muss kontiguös sein.")
+    min_bytes = (height - 1) * stride_bytes + width * 2
+    if mv.nbytes < min_bytes:
+        raise ValueError(f"src: zu klein für height={height}, stride={stride_bytes}, width={width}.")
+    mv16 = mv.cast('H') if mv.itemsize == 1 else mv.cast('H')
+    buf_ref = (C.c_ushort * (mv16.nbytes // 2)).from_buffer(mv16)
+    return C.cast(buf_ref, C.POINTER(C.c_ushort))
+
+class AlignedBuffer:
+    __slots__ = ("_raw", "_mv")
+
+    def __init__(self, size: int, alignment: int = 64):
+        if size <= 0:
+            raise ValueError("size muss > 0 sein.")
+        if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+            raise ValueError("alignment muss Potenz von 2 sein.")
+        self._raw = bytearray(size + alignment)
+        base = C.addressof(C.c_char.from_buffer(self._raw))
+        offset = (alignment - (base % alignment)) % alignment
+        self._mv = memoryview(self._raw)[offset:offset + size]
+
+    @property
+    def memoryview(self) -> memoryview:
+        return self._mv
+
+    @property
+    def buffer(self) -> bytearray:
+        return self._raw
+
+def allocate_aligned_bytes(size: int, alignment: int = 64) -> memoryview:
+    return AlignedBuffer(size, alignment).memoryview
+
+def allocate_aligned_f32(length: int, alignment: int = 64) -> memoryview:
+    mv = AlignedBuffer(length * 4, alignment).memoryview
+    return mv.cast('f')
+
+def pin_memory(buf: Union[memoryview, bytearray, array]) -> bool:
+    mv = memoryview(buf)
+    if mv.readonly:
+        raise ValueError("Buffer darf nicht read-only sein.")
+    if not mv.contiguous:
+        raise ValueError("Buffer muss kontiguös sein.")
+    mv_bytes = mv.cast('B')
+    address = C.addressof(C.c_char.from_buffer(mv_bytes))
+    size = mv.nbytes
+    try:
+        if os.name == "nt":
+            kernel32 = C.windll.kernel32
+            res = kernel32.VirtualLock(C.c_void_p(address), C.c_size_t(size))
+            return bool(res)
+        else:
+            libc_name = ctypes.util.find_library("c") or "libc.so.6"
+            libc = C.CDLL(libc_name)
+            res = libc.mlock(C.c_void_p(address), C.c_size_t(size))
+            return res == 0
+    except Exception:
+        return False
 
 class Impl:
     Scalar      = 0
@@ -277,6 +444,294 @@ class HALO:
         )
         if rc != 0:
             raise RuntimeError(f"halo_img_u8_to_f32_lut_axpby() fehlgeschlagen (rc={rc}).")
+
+    def img_u16_to_f32_axpby_2d(
+        self,
+        src: ArrayLikeU16,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst: ArrayLikeFloat,
+        dst_stride_bytes: int,
+        *,
+        bits_per_sample: int = 10,
+        scale: float = 1.0,
+        offset: float = 0.0,
+        alpha: float = 0.0,
+        beta: float = 1.0,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 2:
+            raise ValueError("src_stride_bytes < width*2 (Bytes) ist ungültig.")
+        if dst_stride_bytes < width * 4:
+            raise ValueError("dst_stride_bytes < width*4 (Bytes) ist ungültig.")
+        c_src = _to_c_u16_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_img_u16_to_f32_axpby(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(bits_per_sample),
+            C.c_float(scale), C.c_float(offset),
+            C.c_float(alpha), C.c_float(beta),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_u16_to_f32_axpby() fehlgeschlagen (rc={rc}).")
+
+    def img_rgb_u8_to_f32_interleaved_2d(
+        self,
+        src: ArrayLikeU8,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_r: ArrayLikeFloat,
+        dst_stride_r: int,
+        dst_g: ArrayLikeFloat,
+        dst_stride_g: int,
+        dst_b: ArrayLikeFloat,
+        dst_stride_b: int,
+        *,
+        scale: float = 1.0,
+        offset: float = 0.0,
+        alpha: float = 0.0,
+        beta: float = 1.0,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 3:
+            raise ValueError("src_stride_bytes < width*3 (Bytes) ist ungültig.")
+        for stride, name in ((dst_stride_r, "dst_stride_r"), (dst_stride_g, "dst_stride_g"), (dst_stride_b, "dst_stride_b")):
+            if stride < width * 4:
+                raise ValueError(f"{name} < width*4 (Bytes) ist ungültig.")
+        c_src = _to_c_u8_ptr_2d(src, width * 3, height, src_stride_bytes)
+        c_r = _to_c_f32_ptr_2d(dst_r, width, height, dst_stride_r)
+        c_g = _to_c_f32_ptr_2d(dst_g, width, height, dst_stride_g)
+        c_b = _to_c_f32_ptr_2d(dst_b, width, height, dst_stride_b)
+        rc = _lib.halo_img_rgb_u8_to_f32_interleaved(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_r, C.c_longlong(dst_stride_r),
+            c_g, C.c_longlong(dst_stride_g),
+            c_b, C.c_longlong(dst_stride_b),
+            C.c_int(width), C.c_int(height),
+            C.c_float(scale), C.c_float(offset),
+            C.c_float(alpha), C.c_float(beta),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_rgb_u8_to_f32_interleaved() fehlgeschlagen (rc={rc}).")
+
+    def img_rgb_u8_to_f32_planar_2d(
+        self,
+        src_r: ArrayLikeU8,
+        src_g: ArrayLikeU8,
+        src_b: ArrayLikeU8,
+        width: int,
+        height: int,
+        src_stride_r: int,
+        src_stride_g: int,
+        src_stride_b: int,
+        dst_r: ArrayLikeFloat,
+        dst_stride_r: int,
+        dst_g: ArrayLikeFloat,
+        dst_stride_g: int,
+        dst_b: ArrayLikeFloat,
+        dst_stride_b: int,
+        *,
+        scale: float = 1.0,
+        offset: float = 0.0,
+        alpha: float = 0.0,
+        beta: float = 1.0,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        for stride, name in ((src_stride_r, "src_stride_r"), (src_stride_g, "src_stride_g"), (src_stride_b, "src_stride_b")):
+            if stride < width:
+                raise ValueError(f"{name} < width (Bytes) ist ungültig.")
+        for stride, name in ((dst_stride_r, "dst_stride_r"), (dst_stride_g, "dst_stride_g"), (dst_stride_b, "dst_stride_b")):
+            if stride < width * 4:
+                raise ValueError(f"{name} < width*4 (Bytes) ist ungültig.")
+        c_r_src = _to_c_u8_ptr_2d(src_r, width, height, src_stride_r)
+        c_g_src = _to_c_u8_ptr_2d(src_g, width, height, src_stride_g)
+        c_b_src = _to_c_u8_ptr_2d(src_b, width, height, src_stride_b)
+        c_r_dst = _to_c_f32_ptr_2d(dst_r, width, height, dst_stride_r)
+        c_g_dst = _to_c_f32_ptr_2d(dst_g, width, height, dst_stride_g)
+        c_b_dst = _to_c_f32_ptr_2d(dst_b, width, height, dst_stride_b)
+        rc = _lib.halo_img_rgb_u8_to_f32_planar(
+            c_r_src, C.c_longlong(src_stride_r),
+            c_g_src, C.c_longlong(src_stride_g),
+            c_b_src, C.c_longlong(src_stride_b),
+            c_r_dst, C.c_longlong(dst_stride_r),
+            c_g_dst, C.c_longlong(dst_stride_g),
+            c_b_dst, C.c_longlong(dst_stride_b),
+            C.c_int(width), C.c_int(height),
+            C.c_float(scale), C.c_float(offset),
+            C.c_float(alpha), C.c_float(beta),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_rgb_u8_to_f32_planar() fehlgeschlagen (rc={rc}).")
+
+    def box_blur_f32(
+        self,
+        src: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst: ArrayLikeFloat,
+        dst_stride_bytes: int,
+        radius: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("stride < width*4 (Bytes) ist ungültig.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_img_box_blur_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(radius),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_box_blur_f32() fehlgeschlagen (rc={rc}).")
+
+    def gauss_blur_f32(
+        self,
+        src: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst: ArrayLikeFloat,
+        dst_stride_bytes: int,
+        radius: int,
+        sigma: float,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("stride < width*4 (Bytes) ist ungültig.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_img_gauss_blur_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(radius),
+            C.c_float(sigma),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_gauss_blur_f32() fehlgeschlagen (rc={rc}).")
+
+    def sobel_f32(
+        self,
+        src: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_gx: ArrayLikeFloat,
+        dst_stride_gx: int,
+        dst_gy: ArrayLikeFloat,
+        dst_stride_gy: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if src_stride_bytes < width * 4:
+            raise ValueError("src_stride_bytes < width*4 (Bytes) ist ungültig.")
+        for stride, name in ((dst_stride_gx, "dst_stride_gx"), (dst_stride_gy, "dst_stride_gy")):
+            if stride < width * 4:
+                raise ValueError(f"{name} < width*4 (Bytes) ist ungültig.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_gx = _to_c_f32_ptr_2d(dst_gx, width, height, dst_stride_gx)
+        c_gy = _to_c_f32_ptr_2d(dst_gy, width, height, dst_stride_gy)
+        rc = _lib.halo_img_sobel_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_gx, C.c_longlong(dst_stride_gx),
+            c_gy, C.c_longlong(dst_stride_gy),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_sobel_f32() fehlgeschlagen (rc={rc}).")
+
+    def resize_f32(
+        self,
+        src: ArrayLikeFloat,
+        src_width: int,
+        src_height: int,
+        src_stride_bytes: int,
+        dst: ArrayLikeFloat,
+        dst_width: int,
+        dst_height: int,
+        dst_stride_bytes: int,
+        *,
+        filter: Union[str, int] = "bilinear",
+        use_mt: bool = True,
+    ) -> None:
+        if src_stride_bytes < src_width * 4 or dst_stride_bytes < dst_width * 4:
+            raise ValueError("stride < width*4 (Bytes) ist ungültig.")
+        filter_code: int
+        if isinstance(filter, str):
+            filt = filter.lower()
+            if filt == "bilinear":
+                filter_code = 0
+            elif filt == "bicubic":
+                filter_code = 1
+            else:
+                raise ValueError("filter muss 'bilinear' oder 'bicubic' sein.")
+        else:
+            filter_code = int(filter)
+        c_src = _to_c_f32_ptr_2d(src, src_width, src_height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, dst_width, dst_height, dst_stride_bytes)
+        rc = _lib.halo_img_resize_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            C.c_int(src_width), C.c_int(src_height),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(dst_width), C.c_int(dst_height),
+            C.c_int(filter_code),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_resize_f32() fehlgeschlagen (rc={rc}).")
+
+    def relu_clamp_axpby_f32(
+        self,
+        src: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst: ArrayLikeFloat,
+        dst_stride_bytes: int,
+        *,
+        alpha: float = 0.0,
+        beta: float = 1.0,
+        clamp_min: float = float('-inf'),
+        clamp_max: float = float('inf'),
+        apply_relu: bool = False,
+        use_mt: bool = True,
+    ) -> None:
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("stride < width*4 (Bytes) ist ungültig.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_img_relu_clamp_axpby_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_float(alpha), C.c_float(beta),
+            C.c_float(clamp_min), C.c_float(clamp_max),
+            C.c_int(1 if apply_relu else 0),
+            C.c_int(1 if use_mt else 0)
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_img_relu_clamp_axpby_f32() fehlgeschlagen (rc={rc}).")
 
     # Optional: manueller Shutdown (z. B. bei langlaufenden Prozessen)
     def close(self) -> None:
