@@ -156,6 +156,116 @@ _lib.halo_resize_bicubic_f32.argtypes = [
 ]
 _lib.halo_resize_bicubic_f32.restype = C.c_int
 
+_lib.halo_flip_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_flip_f32.restype = C.c_int
+
+_lib.halo_rotate90_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int,
+    C.c_int
+]
+_lib.halo_rotate90_f32.restype = C.c_int
+
+_lib.halo_invert_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float, C.c_float,
+    C.c_int,
+    C.c_int
+]
+_lib.halo_invert_f32.restype = C.c_int
+
+_lib.halo_gamma_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float,
+    C.c_float,
+    C.c_int
+]
+_lib.halo_gamma_f32.restype = C.c_int
+
+_lib.halo_levels_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_float,
+    C.c_int
+]
+_lib.halo_levels_f32.restype = C.c_int
+
+_lib.halo_threshold_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_int
+]
+_lib.halo_threshold_f32.restype = C.c_int
+
+_lib.halo_median3x3_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_median3x3_f32.restype = C.c_int
+
+_lib.halo_erode3x3_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_erode3x3_f32.restype = C.c_int
+
+_lib.halo_dilate3x3_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_dilate3x3_f32.restype = C.c_int
+
+_lib.halo_open3x3_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_open3x3_f32.restype = C.c_int
+
+_lib.halo_close3x3_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_int
+]
+_lib.halo_close3x3_f32.restype = C.c_int
+
+_lib.halo_unsharp_mask_f32.argtypes = [
+    C.POINTER(C.c_float), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.c_float,
+    C.c_float,
+    C.c_float,
+    C.c_int
+]
+_lib.halo_unsharp_mask_f32.restype = C.c_int
+
 _lib.halo_relu_clamp_axpby_f32.argtypes = [
     C.POINTER(C.c_float), C.c_longlong,
     C.POINTER(C.c_float), C.c_longlong,
@@ -1171,6 +1281,370 @@ class HALO:
         )
         if rc != 0:
             raise RuntimeError(f"halo_img_rgb_u8_to_f32_planar() fehlgeschlagen (rc={rc}).")
+
+    def flip_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        horizontal: bool = False,
+        vertical: bool = True,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4:
+            raise ValueError("src_stride_bytes zu klein für float32-Bild.")
+        if dst_stride_bytes < width * 4:
+            raise ValueError("dst_stride_bytes zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_flip_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if horizontal else 0),
+            C.c_int(1 if vertical else 0),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_flip_f32() fehlgeschlagen (rc={rc}).")
+
+    def rotate90_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        quarter_turns: int,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        dst_width = height if quarter_turns % 2 else width
+        dst_height = width if quarter_turns % 2 else height
+        if src_stride_bytes < width * 4:
+            raise ValueError("src_stride_bytes zu klein für float32-Bild.")
+        if dst_stride_bytes < dst_width * 4:
+            raise ValueError("dst_stride_bytes zu klein für Zielbild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, dst_width, dst_height, dst_stride_bytes)
+        rc = _lib.halo_rotate90_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(quarter_turns),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc == -5:
+            raise ValueError("In-place-Rotation um 90°/270° erfordert separaten Zielpuffer.")
+        if rc != 0:
+            raise RuntimeError(f"halo_rotate90_f32() fehlgeschlagen (rc={rc}).")
+
+    def invert_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        min_val: float = 0.0,
+        max_val: float = 1.0,
+        use_range: bool = True,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        if use_range and not (max_val > min_val):
+            raise ValueError("max_val muss größer als min_val sein.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_invert_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_float(min_val), C.c_float(max_val),
+            C.c_int(1 if use_range else 0),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_invert_f32() fehlgeschlagen (rc={rc}).")
+
+    def gamma_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        gamma: float,
+        gain: float = 1.0,
+        use_mt: bool = True,
+    ) -> None:
+        if gamma <= 0.0:
+            raise ValueError("gamma muss > 0 sein.")
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_gamma_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_float(gamma), C.c_float(gain),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_gamma_f32() fehlgeschlagen (rc={rc}).")
+
+    def levels_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        in_low: float,
+        in_high: float,
+        out_low: float = 0.0,
+        out_high: float = 1.0,
+        gamma: float = 1.0,
+        use_mt: bool = True,
+    ) -> None:
+        if in_high <= in_low:
+            raise ValueError("in_high muss größer als in_low sein.")
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        if gamma <= 0.0:
+            raise ValueError("gamma muss > 0 sein.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_levels_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_float(in_low), C.c_float(in_high),
+            C.c_float(out_low), C.c_float(out_high),
+            C.c_float(gamma),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_levels_f32() fehlgeschlagen (rc={rc}).")
+
+    def threshold_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        low: float,
+        high: float,
+        low_value: float = 0.0,
+        high_value: float = 1.0,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_threshold_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_float(low), C.c_float(high),
+            C.c_float(low_value), C.c_float(high_value),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_threshold_f32() fehlgeschlagen (rc={rc}).")
+
+    def median3x3_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_median3x3_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_median3x3_f32() fehlgeschlagen (rc={rc}).")
+
+    def erode3x3_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_erode3x3_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_erode3x3_f32() fehlgeschlagen (rc={rc}).")
+
+    def dilate3x3_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_dilate3x3_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_dilate3x3_f32() fehlgeschlagen (rc={rc}).")
+
+    def open3x3_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_open3x3_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_open3x3_f32() fehlgeschlagen (rc={rc}).")
+
+    def close3x3_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        use_mt: bool = True,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_close3x3_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_close3x3_f32() fehlgeschlagen (rc={rc}).")
+
+    def unsharp_mask_f32(
+        self,
+        src: ArrayLikeFloat,
+        dst: ArrayLikeFloat,
+        width: int,
+        height: int,
+        src_stride_bytes: int,
+        dst_stride_bytes: int,
+        *,
+        sigma: float,
+        amount: float = 1.0,
+        threshold: float = 0.0,
+        use_mt: bool = True,
+    ) -> None:
+        if sigma < 0.0:
+            raise ValueError("sigma muss >= 0 sein.")
+        if width <= 0 or height <= 0:
+            raise ValueError("width/height müssen > 0 sein.")
+        if src_stride_bytes < width * 4 or dst_stride_bytes < width * 4:
+            raise ValueError("Stride zu klein für float32-Bild.")
+        c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
+        c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
+        rc = _lib.halo_unsharp_mask_f32(
+            c_src, C.c_longlong(src_stride_bytes),
+            c_dst, C.c_longlong(dst_stride_bytes),
+            C.c_int(width), C.c_int(height),
+            C.c_float(sigma),
+            C.c_float(amount),
+            C.c_float(threshold),
+            C.c_int(1 if use_mt else 0),
+        )
+        if rc != 0:
+            raise RuntimeError(f"halo_unsharp_mask_f32() fehlgeschlagen (rc={rc}).")
 
     def render_vector_scene(
         self,
