@@ -1,23 +1,12 @@
-# halo.py (v0.4) — Python 3.12 Wrapper für HALO v0.3 + 2D-Image-Kern
-# -------------------------------------------------------------------
-# Neu:
-#   - img_u8_to_f32_lut_axpby_2d(): 2D-Imagepfad mit Strides
-#   - Hilfsfunktionen für LUT-Prüfung und Stride-Validierung
-#
-# Erwartete C-API in der DLL (zusätzlich zu v0.3):
-#   int halo_img_u8_to_f32_lut_axpby(const unsigned char* src, long long src_stride,
-#                                    float* dst, long long dst_stride,
-#                                    int width, int height,
-#                                    const float* lut256,
-#                                    float scale, float offset,
-#                                    float alpha, float beta,
-#                                    int use_mt);
+# halo.py (v0.5b) — Python 3.12 Wrapper für HALO v0.5b + 2D-Image-Kern
+# - NEU: atexit-Hook ruft halo_shutdown_pool(), falls in DLL vorhanden.
+# - Optional: HALO.close() für manuellen Shutdown.
 
 from __future__ import annotations
 import ctypes as C
-import json, os, platform
+import json, os, platform, atexit
 from pathlib import Path
-from typing import Union, Sequence
+from typing import Union, Sequence, Tuple
 from array import array
 
 __all__ = ["HALO", "Impl", "make_identity_lut"]
@@ -58,17 +47,23 @@ _lib.halo_saxpy_f32_mt.restype  = C.c_int
 _lib.halo_sum_f32.argtypes = [C.POINTER(C.c_float), C.c_longlong, C.POINTER(C.c_float)]
 _lib.halo_sum_f32.restype  = C.c_int
 
-# NEU: 2D-Image-Kern
 _lib.halo_img_u8_to_f32_lut_axpby.argtypes = [
-    C.POINTER(C.c_ubyte), C.c_longlong,           # src, src_stride (bytes)
-    C.POINTER(C.c_float), C.c_longlong,           # dst, dst_stride (bytes)
-    C.c_int, C.c_int,                              # width, height
-    C.POINTER(C.c_float),                          # lut256[256]
-    C.c_float, C.c_float,                          # scale, offset
-    C.c_float, C.c_float,                          # alpha, beta
-    C.c_int                                        # use_mt (0/1)
+    C.POINTER(C.c_ubyte), C.c_longlong,
+    C.POINTER(C.c_float), C.c_longlong,
+    C.c_int, C.c_int,
+    C.POINTER(C.c_float),
+    C.c_float, C.c_float,
+    C.c_float, C.c_float,
+    C.c_int
 ]
 _lib.halo_img_u8_to_f32_lut_axpby.restype = C.c_int
+
+# Optional: Pool-Shutdown wenn vorhanden (v0.5b+)
+try:
+    _lib.halo_shutdown_pool.restype = None
+    _HAS_SHUTDOWN = True
+except AttributeError:
+    _HAS_SHUTDOWN = False
 
 # ---------------- Profil-Persistenz ----------------
 PROFILE_PATH = Path.home() / ".halo_profile.json"
@@ -88,40 +83,38 @@ def _write_profile(d: dict) -> None:
 ArrayLikeFloat = Union[array, memoryview]
 ArrayLikeU8    = Union[bytes, bytearray, memoryview]
 
-def _to_c_float_ptr(buf: ArrayLikeFloat) -> tuple[C.POINTER(C.c_float), int]:
-    """array('f') oder schreibbarer memoryview('f') → Zero-Copy ctypes-Pointer + Länge (1D)."""
+def _to_c_float_ptr(buf: ArrayLikeFloat) -> Tuple[C.POINTER(C.c_float), int]:
     match buf:
         case arr if isinstance(arr, array) and arr.typecode == 'f':
             n = len(arr)
             c_arr = (C.c_float * n).from_buffer(arr)
             return C.cast(c_arr, C.POINTER(C.c_float)), n
         case mv if isinstance(mv, memoryview) and mv.format == 'f' and mv.contiguous and not mv.readonly:
-            n = mv.shape[0] if hasattr(mv, "shape") and mv.ndim == 1 else (mv.nbytes // C.sizeof(C.c_float))
-            c_arr = (C.c_float * n).from_buffer(mv)
+            n = mv.shape[0] if hasattr(mv, "shape") and getattr(mv, "ndim", 1) == 1 else (mv.nbytes // C.sizeof(C.c_float))
+            c_arr = (C.c_float * (mv.nbytes // 4)).from_buffer(mv)
             return C.cast(c_arr, C.POINTER(C.c_float)), n
         case _:
             raise TypeError("Erwarte array('f') oder schreibbaren, kontiguösen memoryview('f').")
 
 def _to_c_u8_ptr_2d(buf: ArrayLikeU8, width: int, height: int, stride_bytes: int) -> C.POINTER(C.c_ubyte):
-    """bytes/bytearray/memoryview('B'/'b') als 2D-Quellpuffer mit gegebenem Stride (in Bytes)."""
     if isinstance(buf, (bytes, bytearray)):
         mv = memoryview(buf)
     elif isinstance(buf, memoryview):
         mv = buf
     else:
         raise TypeError("src erwartet bytes, bytearray oder memoryview.")
-    # Format check: 'B' (unsigned) oder 'b' (signed) sind 1-Byte; wir casten auf unsigned.
     if mv.itemsize != 1 or not mv.contiguous:
         raise TypeError("src muss kontiguös und 1-Byte-Elemente haben.")
-    # Kapazitätscheck (konservativ)
     min_bytes = (height - 1) * stride_bytes + width
     if mv.nbytes < min_bytes:
         raise ValueError(f"src: zu klein für height={height}, stride={stride_bytes}, width={width}.")
-    c_arr = (C.c_ubyte * mv.nbytes).from_buffer(mv) if not mv.readonly else (C.c_ubyte * mv.nbytes).from_buffer_copy(mv)
+    if mv.readonly:
+        c_arr = (C.c_ubyte * mv.nbytes).from_buffer_copy(mv)
+    else:
+        c_arr = (C.c_ubyte * mv.nbytes).from_buffer(mv)
     return C.cast(c_arr, C.POINTER(C.c_ubyte))
 
 def _to_c_f32_ptr_2d(buf: ArrayLikeFloat, width: int, height: int, stride_bytes: int) -> C.POINTER(C.c_float):
-    """array('f') / memoryview('f') als 2D-Zielpuffer mit vorgegebenem Stride (Bytes)."""
     match buf:
         case arr if isinstance(arr, array) and arr.typecode == 'f':
             mv = memoryview(arr)
@@ -129,20 +122,18 @@ def _to_c_f32_ptr_2d(buf: ArrayLikeFloat, width: int, height: int, stride_bytes:
             pass
         case _:
             raise TypeError("dst erwartet array('f') oder schreibbaren, kontiguösen memoryview('f').")
-    # Kapazitätscheck: stride_bytes ist Bytes/Zeile
     min_bytes = (height - 1) * stride_bytes + width * 4
     if mv.nbytes < min_bytes:
         raise ValueError(f"dst: zu klein für height={height}, stride={stride_bytes}, width={width}.")
-    c_arr = (C.c_float * (mv.nbytes // 4)).from_buffer(mv)  # Zero-Copy
+    c_arr = (C.c_float * (mv.nbytes // 4)).from_buffer(mv)
     return C.cast(c_arr, C.POINTER(C.c_float))
 
 def _to_c_lut_ptr(lut: Union[Sequence[float], array, memoryview]) -> C.POINTER(C.c_float):
-    """LUT muss 256 float-Werte enthalten."""
     if isinstance(lut, array) and lut.typecode == 'f' and len(lut) == 256:
         c_arr = (C.c_float * 256).from_buffer(lut)
         return C.cast(c_arr, C.POINTER(C.c_float))
     if isinstance(lut, memoryview) and lut.format == 'f' and lut.contiguous and len(lut) == 256:
-        c_arr = (C.c_float * 256).from_buffer(lut)  # Zero-Copy
+        c_arr = (C.c_float * 256).from_buffer(lut)
         return C.cast(c_arr, C.POINTER(C.c_float))
     if isinstance(lut, Sequence) and len(lut) == 256:
         arrf = array('f', lut)
@@ -151,7 +142,6 @@ def _to_c_lut_ptr(lut: Union[Sequence[float], array, memoryview]) -> C.POINTER(C
     raise ValueError("LUT muss genau 256 float-Werte enthalten (array('f'), memoryview('f') oder Sequenz).")
 
 def make_identity_lut() -> array:
-    """Erzeugt LUT[i] = float(i)."""
     return array('f', [float(i) for i in range(256)])
 
 class Impl:
@@ -162,9 +152,6 @@ class Impl:
 
 # ---------------- Haupt-Klasse ----------------
 class HALO:
-    """
-    HALO v0.4 – inklusive 2D-Image-Kern mit Strides.
-    """
     def __init__(
         self,
         n_autotune: int = 1_000_000,
@@ -178,7 +165,9 @@ class HALO:
             raise RuntimeError("halo_init_features() fehlgeschlagen.")
         self.features = self._query_features()
 
-        self.configure(enable_streaming=enable_streaming, stream_threshold=stream_threshold, threads=threads)
+        self.configure(enable_streaming=enable_streaming,
+                       stream_threshold=stream_threshold,
+                       threads=threads)
 
         self.profile = _read_profile()
         need_tune = force_autotune or ("saxpy_impl" not in self.profile) or ("sum_impl" not in self.profile)
@@ -200,14 +189,24 @@ class HALO:
             }
             _write_profile(self.profile)
         else:
-            _lib.halo_set_impls(C.c_int(self.profile["saxpy_impl"]), C.c_int(self.profile["sum_impl"]))
+            if _lib.halo_set_impls(C.c_int(self.profile["saxpy_impl"]),
+                                   C.c_int(self.profile["sum_impl"])) != 0:
+                raise RuntimeError("halo_set_impls() fehlgeschlagen.")
 
-    # ---- Public API (bestehend) ----
     def configure(self, enable_streaming: bool, stream_threshold: int, threads: int) -> None:
         if _lib.halo_configure(C.c_int(1 if enable_streaming else 0),
                                C.c_longlong(stream_threshold),
                                C.c_int(threads)) != 0:
             raise RuntimeError("halo_configure() fehlgeschlagen.")
+
+    def set_threads(self, threads: int) -> None:
+        cfg = self.profile.get("cfg", {})
+        streaming = bool(cfg.get("streaming", True))
+        thr       = int(cfg.get("thr", 1_000_000))
+        self.configure(enable_streaming=streaming, stream_threshold=thr, threads=threads)
+        cfg.update({"threads": int(threads)})
+        self.profile["cfg"] = cfg
+        _write_profile(self.profile)
 
     def saxpy(self, a: float, x: ArrayLikeFloat, y: ArrayLikeFloat) -> None:
         xptr, n1 = _to_c_float_ptr(x)
@@ -240,7 +239,6 @@ class HALO:
             self.profile["sum_impl"]   = sum_impl
             _write_profile(self.profile)
 
-    # ---- Neu: 2D-Image-Kern ----
     def img_u8_to_f32_lut_axpby_2d(
         self,
         src: ArrayLikeU8,
@@ -257,22 +255,6 @@ class HALO:
         beta: float = 1.0,
         use_mt: bool = True,
     ) -> None:
-        """
-        Wendet auf ein 2D-uint8-Bild eine LUT + Affintransformation an und mischt in dst:
-
-            tmp = lut[src] * scale + offset
-            dst = alpha * dst + beta * tmp
-
-        Parameter:
-            src: bytes/bytearray/memoryview (1 Byte pro Pixel), Größe mindestens height*stride
-            width, height: Bilddimensionen (Pixel)
-            src_stride_bytes: Byte-Stride pro src-Zeile (>= width)
-            dst: array('f') oder memoryview('f'), float32-Zielpuffer
-            dst_stride_bytes: Bytes pro dst-Zeile (>= width*4)
-            lut256: 256 floats (array('f') empfohlen)
-            scale, offset, alpha, beta: Skalare
-            use_mt: True → Multi-Thread, False → Single-Thread
-        """
         if width <= 0 or height <= 0:
             raise ValueError("width/height müssen > 0 sein.")
         if src_stride_bytes < width:
@@ -296,9 +278,27 @@ class HALO:
         if rc != 0:
             raise RuntimeError(f"halo_img_u8_to_f32_lut_axpby() fehlgeschlagen (rc={rc}).")
 
+    # Optional: manueller Shutdown (z. B. bei langlaufenden Prozessen)
+    def close(self) -> None:
+        if _HAS_SHUTDOWN:
+            try:
+                _lib.halo_shutdown_pool()
+            except Exception:
+                pass
+
     # ---- intern ----
     def _query_features(self) -> dict:
         sse2 = C.c_int(0); avx2 = C.c_int(0); avx512 = C.c_int(0)
         if _lib.halo_query_features(C.byref(sse2), C.byref(avx2), C.byref(avx512)) != 0:
             raise RuntimeError("halo_query_features() fehlgeschlagen.")
         return {"sse2": bool(sse2.value), "avx2": bool(avx2.value), "avx512": bool(avx512.value)}
+
+# Automatischer Pool-Shutdown beim Interpreter-Exit
+def _shutdown_pool_if_available():
+    if _HAS_SHUTDOWN:
+        try:
+            _lib.halo_shutdown_pool()
+        except Exception:
+            pass
+
+atexit.register(_shutdown_pool_if_available)

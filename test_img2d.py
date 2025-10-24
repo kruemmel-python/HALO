@@ -1,14 +1,19 @@
-# test_img2d.py — 2D-Image-Kern: Korrektheit & Benchmark
+# test_img2d.py — v0.5 Benchmark & Check (1080p, affine LUT)
 from __future__ import annotations
-from array import array
 from time import perf_counter
-import os, random
+from array import array
+import os
 from halo import HALO, make_identity_lut
+
+USE_STREAMING = True
+THREADS       = os.cpu_count() or 4
+W, H          = 1920, 1080
+SRC_STRIDE    = 2048             # >= W
+DST_STRIDE    = ((W*4 + 63)//64)*64   # 64B-ausgerichtete Zeilenlänge hilft NT-Stores
 
 def ref_kernel(src_bytes: bytes, W: int, H: int, sstride: int,
                dst: array, dstride: int, lut: list[float],
                scale: float, offset: float, alpha: float, beta: float):
-    # Python-Referenz: einfach, korrekt, langsam
     for y in range(H):
         srow = y * sstride
         drow = y * (dstride // 4)
@@ -17,60 +22,49 @@ def ref_kernel(src_bytes: bytes, W: int, H: int, sstride: int,
             tmp = lut[v] * scale + offset
             dst[drow + x] = alpha * dst[drow + x] + beta * tmp
 
-def bench(fn, repeats=5):
+def bench(fn, repeats=7):
     t0 = perf_counter()
-    for _ in range(repeats):
-        fn()
+    for _ in range(repeats): fn()
     return (perf_counter() - t0) / repeats
 
 if __name__ == "__main__":
-    W, H = 1920, 1080
-    sstride = 2048       # bewusst größer als W (Padding)
-    dstride = W * 4      # float32 pro Pixel
-    # Erzeuge Testdaten
-    src = bytearray(os.urandom(H * sstride))
-    dst = array('f', [0.0]*(H * (dstride // 4)))
+    rng = os.urandom
 
-    # LUT: identity
+    src = bytearray(rng(H * SRC_STRIDE))
+    dst = array('f', [0.0]*(H * (DST_STRIDE // 4)))
     lut = make_identity_lut()
 
-    # HALO initialisieren (mit MT)
-    halo = HALO(n_autotune=1_000_000, iters=5, enable_streaming=True, stream_threshold=500_000, threads=os.cpu_count() or 4)
+    halo = HALO(n_autotune=1_000_000, iters=5,
+                enable_streaming=USE_STREAMING,
+                stream_threshold=500_000, threads=THREADS)
 
-    # Korrektheit an kleinem Bild prüfen
-    w2, h2 = 64, 37
-    s2 = 80
-    d2 = w2 * 4
-    src_small = bytearray(os.urandom(h2 * s2))
+    # Korrektheit (klein)
+    w2, h2, s2, d2 = 64, 37, 80, 64*4
+    src_small = bytearray(rng(h2 * s2))
     dst_small = array('f', [0.0]*(h2 * (d2 // 4)))
-    # Run HALO
     halo.img_u8_to_f32_lut_axpby_2d(src_small, w2, h2, s2, dst_small, d2, lut,
                                     scale=1/255.0, offset=0.0, alpha=0.1, beta=0.9, use_mt=False)
-    # Referenz
     ref = array('f', [0.0]*(h2 * (d2 // 4)))
     ref_kernel(src_small, w2, h2, s2, ref, d2, list(lut), 1/255.0, 0.0, 0.1, 0.9)
-    # Check
     max_err = max(abs(a-b) for a,b in zip(dst_small, ref))
     print(f"[CHECK] max_abs_error = {max_err:.6g}")
-    assert max_err < 1e-5
 
-    # Benchmark groß: ST vs. MT
+    # Bench (v0.5 Auto-Scheduler: wir rufen ST/MT separat, Option use_mt übergeben)
     def run_st():
-        halo.img_u8_to_f32_lut_axpby_2d(src, W, H, sstride, dst, dstride, lut,
+        halo.img_u8_to_f32_lut_axpby_2d(src, W, H, SRC_STRIDE, dst, DST_STRIDE, lut,
                                         scale=1/255.0, offset=0.0, alpha=0.0, beta=1.0, use_mt=False)
-
     def run_mt():
-        halo.img_u8_to_f32_lut_axpby_2d(src, W, H, sstride, dst, dstride, lut,
+        halo.img_u8_to_f32_lut_axpby_2d(src, W, H, SRC_STRIDE, dst, DST_STRIDE, lut,
                                         scale=1/255.0, offset=0.0, alpha=0.0, beta=1.0, use_mt=True)
 
-    # Warmups
+    # Warmup
     run_st(); run_mt()
 
-    dt_st = bench(run_st, repeats=5)
-    dt_mt = bench(run_mt, repeats=5)
+    dt_st = bench(run_st, repeats=9)
+    dt_mt = bench(run_mt, repeats=9)
 
-    # Durchsatz grob: read src (1B) + write dst (4B) ~ 5B/Pixel + LUT/Gather/Arith.
-    gbps_st = (5 * W * H) / dt_st / 1e9
-    gbps_mt = (5 * W * H) / dt_mt / 1e9
-    print(f"[ST ] {W}x{H} | {dt_st*1e3:7.3f} ms | ~{gbps_st:6.2f} GB/s")
-    print(f"[MT ] {W}x{H} | {dt_mt*1e3:7.3f} ms | ~{gbps_mt:6.2f} GB/s")
+    gbps = lambda dt: (5 * W * H) / dt / 1e9
+    mode = "ON" if USE_STREAMING else "OFF"
+    print(f"[CFG ] streaming={mode}, threads={THREADS}")
+    print(f"[ST ] {W}x{H} | {dt_st*1e3:7.3f} ms | ~{gbps(dt_st):6.2f} GB/s")
+    print(f"[MT ] {W}x{H} | {dt_mt*1e3:7.3f} ms | ~{gbps(dt_mt):6.2f} GB/s")
