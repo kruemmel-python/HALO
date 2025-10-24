@@ -16,6 +16,7 @@ __all__ = [
     "make_aligned_u8_buffer",
     "make_aligned_f32_buffer",
     "make_pinned_float_array",
+    "HALO_VERSION",
 ]
 
 # ---------------- Laden der DLL/.so ----------------
@@ -29,6 +30,12 @@ def _load_lib() -> C.CDLL:
         return C.CDLL(str(cand)) if cand.exists() else C.CDLL("libhalo_fastpath.so")
 
 _lib = _load_lib()
+
+try:
+    _lib.halo_version.restype = C.c_char_p
+    HALO_VERSION = _lib.halo_version().decode("utf-8", "ignore")
+except Exception:
+    HALO_VERSION = "unknown"
 
 # ---------------- ctypes-Signaturen ----------------
 _lib.halo_init_features.restype = C.c_int
