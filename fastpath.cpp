@@ -34,6 +34,17 @@
   #define HALO_X86 0
 #endif
 
+#if HALO_X86
+#ifndef _mm256_set_m128i
+  #define _mm256_set_m128i(hi, lo) \
+    _mm256_insertf128_si256(_mm256_castsi128_si256((lo)), (hi), 1)
+#endif
+#ifndef _mm256_set_m128
+  #define _mm256_set_m128(hi, lo) \
+    _mm256_insertf128_ps(_mm256_castps128_ps256((lo)), (hi), 1)
+#endif
+#endif
+
 #if !defined(_MSC_VER) && HALO_X86
   #include <cpuid.h>
 #endif
@@ -52,6 +63,13 @@ static bool g_has_avx512 = false;
 static bool    g_streaming_enabled = true;
 static int64_t g_stream_threshold  = 1'000'000;  // SAXPY-NT-Schwelle (Elemente)
 static int     g_threads           = 1;          // gewünschte Worker-Anzahl
+
+static constexpr int      kNtMinWidthDefault   = 1024;
+static constexpr int64_t  kNtMinBytesDefault   = 8ll << 20;   // 8 MiB
+static constexpr int      kNtHighWidth         = 4096;
+static constexpr int64_t  kNtHighBytes         = 32ll << 20;  // 32 MiB
+static constexpr int64_t  kTargetTaskBytes     = 6ll << 20;   // ~6 MiB pro Task (LLC-optimiert)
+static constexpr int64_t  kSmallTaskBytes      = 768ll << 10; // ~0.75 MiB, für feine Granularität
 
 static inline double now_sec() {
   using clock = std::chrono::steady_clock;
@@ -136,7 +154,12 @@ public:
   // NEU v0.5b: explizit von außen beendbar (C-API)
   void stop_all() { shutdown(); }
 
-  void parallel_for_rows(int rows, const std::function<void(int,int)>& fn, int min_rows_per_task=1) {
+  void parallel_for_rows(
+    int rows,
+    const std::function<void(int,int)>& fn,
+    int min_rows_per_task=1,
+    int chunk_rows_hint=0
+  ) {
     if (rows <= 0) return;
 
     // Falls nur 1 Thread oder wenig Arbeit: direkt ausführen
@@ -151,6 +174,21 @@ public:
       return;
     }
 
+    if (chunk_rows_hint > 0) {
+      if (chunk_rows_hint < min_rows_per_task) chunk_rows_hint = min_rows_per_task;
+    }
+
+    int chunk = chunk_rows_hint > 0
+      ? chunk_rows_hint
+      : std::max(min_rows_per_task, (rows + max_tasks - 1) / max_tasks);
+    if (chunk <= 0) chunk = min_rows_per_task;
+
+    int tasks = (rows + chunk - 1) / chunk;
+    if (tasks <= 1) {
+      fn(0, rows);
+      return;
+    }
+
     // Latch für Fertigstellung
     struct Latch {
       std::mutex m;
@@ -158,26 +196,21 @@ public:
       int count;
     };
     auto latch = std::make_shared<Latch>();
-    latch->count = max_tasks;
+    latch->count = tasks;
 
-    int chunk = rows / max_tasks;
-    int y = 0;
-    for (int i=0; i<max_tasks-1; ++i) {
-      int y0 = y;
+    int y0 = 0;
+    for (int i=0; i<tasks; ++i) {
       int y1 = y0 + chunk;
-      y = y1;
+      if (y1 > rows) y1 = rows;
+      int job_y0 = y0;
+      int job_y1 = y1;
+      y0 = y1;
       enqueue([=]() {
-        fn(y0, y1);
+        fn(job_y0, job_y1);
         std::unique_lock<std::mutex> lk2(latch->m);
         if (--latch->count == 0) latch->cv.notify_one();
       });
     }
-    int y0 = y, y1 = rows;
-    enqueue([=]() {
-      fn(y0, y1);
-      std::unique_lock<std::mutex> lk2(latch->m);
-      if (--latch->count == 0) latch->cv.notify_one();
-    });
 
     // Warten
     std::unique_lock<std::mutex> lk(latch->m);
@@ -408,7 +441,7 @@ static void saxpy_mt(float a, const float* x, float* y, int64_t n, int threads) 
     int64_t begin = idx * chunk;
     int64_t end   = (idx == totalT - 1) ? n : (begin + chunk);
     saxpy_slice(a, x, y, begin, end);
-  }, /*min_rows_per_task=*/1);
+  }, /*min_rows_per_task=*/1, /*chunk_rows_hint=*/1);
 }
 
 // ------------------ LUT-Analyse ------------------
@@ -421,6 +454,64 @@ static inline bool lut_is_affine(const float* lut256, float& a, float& b) {
     if (std::fabs(lut256[i] - want) > eps) return false;
   }
   return true;
+}
+
+static inline int compute_min_rows_per_task(int width, int height, int64_t row_bytes) {
+  if (height <= 1) return 1;
+  int min_rows = 1;
+
+  if (width < 512) min_rows = std::max(min_rows, 2);
+  if (width < 256) min_rows = std::max(min_rows, 3);
+  if (width < 192) min_rows = std::max(min_rows, 4);
+  if (width < 128) min_rows = std::max(min_rows, 6);
+  if (width < 64)  min_rows = std::max(min_rows, 8);
+
+  if (row_bytes <= 512 * 1024) min_rows = std::max(min_rows, 2);
+  if (row_bytes <= 256 * 1024) min_rows = std::max(min_rows, 3);
+  if (row_bytes <= 128 * 1024) min_rows = std::max(min_rows, 4);
+  if (row_bytes <= 64  * 1024) min_rows = std::max(min_rows, 6);
+  if (row_bytes <= 32  * 1024) min_rows = std::max(min_rows, 8);
+  if (row_bytes <= 16  * 1024) min_rows = std::max(min_rows, 12);
+  if (row_bytes <= 8   * 1024) min_rows = std::max(min_rows, 16);
+
+  if (min_rows > height) min_rows = height;
+  if (min_rows < 1) min_rows = 1;
+  return min_rows;
+}
+
+static inline int compute_chunk_rows_hint(int width, int height, int min_rows, int threads, int64_t row_bytes, int64_t total_bytes) {
+  if (height <= min_rows) return height;
+  int64_t target = (threads > 1) ? kTargetTaskBytes : kSmallTaskBytes;
+  if (total_bytes < (int64_t)threads * kSmallTaskBytes) target = std::max<int64_t>(target / 2, kSmallTaskBytes);
+  if (width >= 2048) target += 1ll << 20;
+  if (width <= 256) target = std::max<int64_t>(target / 2, 384ll << 10);
+  int64_t denom = std::max<int64_t>(row_bytes, 1);
+  int chunk = (int)((target + denom - 1) / denom);
+  if (chunk < min_rows) chunk = min_rows;
+  if (chunk > height) chunk = height;
+  return chunk;
+}
+
+static inline bool should_use_streaming(int width, int64_t total_bytes, bool dst_aligned, bool stride_aligned) {
+  if (!g_streaming_enabled || !dst_aligned || !stride_aligned) return false;
+  if (width >= kNtHighWidth && total_bytes >= kNtHighBytes) return true;
+  return (width >= kNtMinWidthDefault) && (total_bytes >= kNtMinBytesDefault);
+}
+
+struct ScheduleDecision {
+  int  min_rows;
+  int  chunk_hint;
+  bool do_mt;
+};
+
+static inline ScheduleDecision compute_schedule(int width, int height, int threads, int64_t row_work, int64_t total_bytes, bool use_mt) {
+  ScheduleDecision d;
+  d.min_rows = compute_min_rows_per_task(width, height, row_work);
+  d.chunk_hint = compute_chunk_rows_hint(width, height, d.min_rows, threads, row_work, total_bytes);
+  const bool enough_rows = height > d.min_rows;
+  const bool enough_bytes = total_bytes >= (int64_t)threads * kSmallTaskBytes;
+  d.do_mt = use_mt && threads > 1 && enough_rows && enough_bytes;
+  return d;
 }
 
 // =====================================================
@@ -446,6 +537,76 @@ static void img_u8_to_f32_lut_axpby_scalar(
   }
 }
 
+static void img_u16_to_f32_axpby_scalar(
+  const uint16_t* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height,
+  uint16_t mask,
+  float inv_max,
+  float scale, float offset,
+  float alpha, float beta
+) {
+  for (int y=0; y<height; ++y) {
+    const uint16_t* srow = (const uint16_t*)((const uint8_t*)src + y * src_stride);
+    float*          drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<width; ++x) {
+      float sample = float(srow[x] & mask) * inv_max;
+      float tmp = sample * scale + offset;
+      drow[x] = alpha * drow[x] + beta * tmp;
+    }
+  }
+}
+
+static void img_rgb_u8_to_f32_interleaved_scalar(
+  const uint8_t* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height,
+  float scale, float offset,
+  float alpha, float beta
+) {
+  for (int y=0; y<height; ++y) {
+    const uint8_t* srow = src + y * src_stride;
+    float*         drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<width; ++x) {
+      const int si = x * 3;
+      const int di = x * 3;
+      for (int c=0; c<3; ++c) {
+        float tmp = float(srow[si + c]) * scale + offset;
+        drow[di + c] = alpha * drow[di + c] + beta * tmp;
+      }
+    }
+  }
+}
+
+static void img_rgb_u8_to_f32_planar_scalar(
+  const uint8_t* src_r, int64_t src_r_stride,
+  const uint8_t* src_g, int64_t src_g_stride,
+  const uint8_t* src_b, int64_t src_b_stride,
+  float* dst_r, int64_t dst_r_stride,
+  float* dst_g, int64_t dst_g_stride,
+  float* dst_b, int64_t dst_b_stride,
+  int width, int height,
+  float scale, float offset,
+  float alpha, float beta
+) {
+  for (int y=0; y<height; ++y) {
+    const uint8_t* srow_r = src_r + y * src_r_stride;
+    const uint8_t* srow_g = src_g + y * src_g_stride;
+    const uint8_t* srow_b = src_b + y * src_b_stride;
+    float* drow_r = (float*)((uint8_t*)dst_r + y * dst_r_stride);
+    float* drow_g = (float*)((uint8_t*)dst_g + y * dst_g_stride);
+    float* drow_b = (float*)((uint8_t*)dst_b + y * dst_b_stride);
+    for (int x=0; x<width; ++x) {
+      float tmp_r = float(srow_r[x]) * scale + offset;
+      float tmp_g = float(srow_g[x]) * scale + offset;
+      float tmp_b = float(srow_b[x]) * scale + offset;
+      drow_r[x] = alpha * drow_r[x] + beta * tmp_r;
+      drow_g[x] = alpha * drow_g[x] + beta * tmp_g;
+      drow_b[x] = alpha * drow_b[x] + beta * tmp_b;
+    }
+  }
+}
+
 #if HALO_X86
 // Gather-Pfad (beliebige LUT)
 static bool img_u8_to_f32_lut_axpby_avx2_gather(
@@ -455,7 +616,8 @@ static bool img_u8_to_f32_lut_axpby_avx2_gather(
   const float* lut256,
   float scale, float offset,
   float alpha, float beta,
-  bool allow_stream
+  bool allow_stream,
+  bool allow_aligned
 ) {
   const __m256 vscale = _mm256_set1_ps(scale);
   const __m256 voffs  = _mm256_set1_ps(offset);
@@ -485,12 +647,15 @@ static bool img_u8_to_f32_lut_axpby_avx2_gather(
 
       __m256 vL   = _mm256_i32gather_ps(lut256, idx8, 4);
       __m256 vtmp = _mm256_fmadd_ps(vL, vscale, voffs);
-      __m256 vdst = _mm256_loadu_ps(drow + x);
+      __m256 vdst = allow_aligned ? _mm256_load_ps(drow + x)
+                                  : _mm256_loadu_ps(drow + x);
       __m256 vout = _mm256_fmadd_ps(valpha, vdst, _mm256_mul_ps(vbeta, vtmp));
 
       if (allow_stream) {
         _mm256_stream_ps(drow + x, vout);
         any_stream = true;
+      } else if (allow_aligned) {
+        _mm256_store_ps(drow + x, vout);
       } else {
         _mm256_storeu_ps(drow + x, vout);
       }
@@ -512,7 +677,8 @@ static bool img_u8_to_f32_lut_axpby_avx2_affine(
   int width, int height,
   float slope, float intercept,
   float alpha, float beta,
-  bool allow_stream
+  bool allow_stream,
+  bool allow_aligned
 ) {
   const __m256 vslope = _mm256_set1_ps(slope);
   const __m256 vinter = _mm256_set1_ps(intercept);
@@ -542,12 +708,15 @@ static bool img_u8_to_f32_lut_axpby_avx2_affine(
       __m256  vf8     = _mm256_cvtepi32_ps(i32x8);
 
       __m256 vtmp = _mm256_fmadd_ps(vslope, vf8, vinter);
-      __m256 vdst = _mm256_loadu_ps(drow + x);
+      __m256 vdst = allow_aligned ? _mm256_load_ps(drow + x)
+                                  : _mm256_loadu_ps(drow + x);
       __m256 vout = _mm256_fmadd_ps(valpha, vdst, _mm256_mul_ps(vbeta, vtmp));
 
       if (allow_stream) {
         _mm256_stream_ps(drow + x, vout);
         any_stream = true;
+      } else if (allow_aligned) {
+        _mm256_store_ps(drow + x, vout);
       } else {
         _mm256_storeu_ps(drow + x, vout);
       }
@@ -560,6 +729,66 @@ static bool img_u8_to_f32_lut_axpby_avx2_affine(
   }
   return any_stream;
 }
+
+static bool img_u16_to_f32_axpby_avx2(
+  const uint16_t* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height,
+  uint16_t mask,
+  float inv_max,
+  float scale, float offset,
+  float alpha, float beta,
+  bool allow_stream,
+  bool allow_aligned
+) {
+  const __m256 vinv   = _mm256_set1_ps(inv_max);
+  const __m256 vscale = _mm256_set1_ps(scale);
+  const __m256 voffs  = _mm256_set1_ps(offset);
+  const __m256 valpha = _mm256_set1_ps(alpha);
+  const __m256 vbeta  = _mm256_set1_ps(beta);
+  const __m256i vmask = _mm256_set1_epi32((int)mask);
+
+  bool any_stream = false;
+
+  for (int y=0; y<height; ++y) {
+    const uint16_t* srow = (const uint16_t*)((const uint8_t*)src + y * src_stride);
+    float*          drow = (float*)((uint8_t*)dst + y * dst_stride);
+
+    int x = 0;
+    for (; x < width && ((reinterpret_cast<uintptr_t>(drow + x) & 31ull) != 0ull); ++x) {
+      float sample = float(srow[x] & mask) * inv_max;
+      float tmp = sample * scale + offset;
+      drow[x] = alpha * drow[x] + beta * tmp;
+    }
+
+    for (; x + 8 <= width; x += 8) {
+      __m128i vsrc16 = _mm_loadu_si128((const __m128i*)(srow + x));
+      __m256i vi32   = _mm256_cvtepu16_epi32(vsrc16);
+      vi32 = _mm256_and_si256(vi32, vmask);
+      __m256 vfloat = _mm256_mul_ps(_mm256_cvtepi32_ps(vi32), vinv);
+      __m256 vtmp   = _mm256_fmadd_ps(vfloat, vscale, voffs);
+      __m256 vdst   = allow_aligned ? _mm256_load_ps(drow + x)
+                                    : _mm256_loadu_ps(drow + x);
+      __m256 vout   = _mm256_fmadd_ps(valpha, vdst, _mm256_mul_ps(vbeta, vtmp));
+      if (allow_stream) {
+        _mm256_stream_ps(drow + x, vout);
+        any_stream = true;
+      } else if (allow_aligned) {
+        _mm256_store_ps(drow + x, vout);
+      } else {
+        _mm256_storeu_ps(drow + x, vout);
+      }
+    }
+
+    for (; x < width; ++x) {
+      float sample = float(srow[x] & mask) * inv_max;
+      float tmp = sample * scale + offset;
+      drow[x] = alpha * drow[x] + beta * tmp;
+    }
+  }
+
+  return any_stream;
+}
 #endif // HALO_X86
 
 // Worker: verarbeitet [y0,y1)
@@ -570,7 +799,8 @@ static void img_kernel_rows(
   const float* lut256,
   float scale, float offset,
   float alpha, float beta,
-  bool allow_stream
+  bool allow_stream,
+  bool allow_aligned
 ) {
 #if HALO_X86
   if (g_has_avx2) {
@@ -585,7 +815,8 @@ static void img_kernel_rows(
         (float*)(((uint8_t*)dst) + (int64_t)y0 * dst_stride), dst_stride,
         width, (y1 - y0),
         slope, inter, alpha, beta,
-        allow_stream
+        allow_stream,
+        allow_aligned
       );
     } else {
       used = img_u8_to_f32_lut_axpby_avx2_gather(
@@ -593,7 +824,8 @@ static void img_kernel_rows(
         (float*)(((uint8_t*)dst) + (int64_t)y0 * dst_stride), dst_stride,
         width, (y1 - y0),
         lut256, scale, offset, alpha, beta,
-        allow_stream
+        allow_stream,
+        allow_aligned
       );
     }
     if (used) _mm_sfence();
@@ -608,10 +840,166 @@ static void img_kernel_rows(
   );
 }
 
+static void img_u16_kernel_rows(
+  const uint16_t* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int y0, int y1,
+  uint16_t mask, float inv_max,
+  float scale, float offset,
+  float alpha, float beta,
+  bool allow_stream,
+  bool allow_aligned
+) {
+#if HALO_X86
+  if (g_has_avx2) {
+    const uint16_t* src_base = (const uint16_t*)((const uint8_t*)src + (int64_t)y0 * src_stride);
+    float* dst_base = (float*)(((uint8_t*)dst) + (int64_t)y0 * dst_stride);
+    bool used = img_u16_to_f32_axpby_avx2(
+      src_base, src_stride,
+      dst_base, dst_stride,
+      width, (y1 - y0),
+      mask, inv_max, scale, offset, alpha, beta,
+      allow_stream, allow_aligned
+    );
+    if (used) _mm_sfence();
+    return;
+  }
+#endif
+  const uint16_t* src_base = (const uint16_t*)((const uint8_t*)src + (int64_t)y0 * src_stride);
+  float* dst_base = (float*)(((uint8_t*)dst) + (int64_t)y0 * dst_stride);
+  img_u16_to_f32_axpby_scalar(
+    src_base, src_stride,
+    dst_base, dst_stride,
+    width, (y1 - y0),
+    mask, inv_max, scale, offset, alpha, beta
+  );
+}
+
+static void img_rgb_interleaved_kernel_rows(
+  const uint8_t* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int y0, int y1,
+  float scale, float offset,
+  float alpha, float beta
+) {
+#if HALO_X86
+  if (g_has_avx2 && width >= 4) {
+    const __m128 vscale = _mm_set1_ps(scale);
+    const __m128 voffset = _mm_set1_ps(offset);
+    const __m128 valpha = _mm_set1_ps(alpha);
+    const __m128 vbeta  = _mm_set1_ps(beta);
+    const __m128i idx_r = _mm_setr_epi32(0, 3, 6, 9);
+    const __m128i idx_g = _mm_setr_epi32(1, 4, 7, 10);
+    const __m128i idx_b = _mm_setr_epi32(2, 5, 8, 11);
+    const __m128i mask_r = _mm_setr_epi8(
+      0, 3, 6, 9,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80
+    );
+    const __m128i mask_g = _mm_setr_epi8(
+      1, 4, 7, 10,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80
+    );
+    const __m128i mask_b = _mm_setr_epi8(
+      2, 5, 8, 11,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80,
+      (char)0x80, (char)0x80, (char)0x80, (char)0x80
+    );
+
+    alignas(16) float out_r[4];
+    alignas(16) float out_g[4];
+    alignas(16) float out_b[4];
+
+    for (int y = y0; y < y1; ++y) {
+      const uint8_t* srow = src + (int64_t)y * src_stride;
+      float* drow = (float*)(((uint8_t*)dst) + (int64_t)y * dst_stride);
+      int x = 0;
+      for (; x + 8 <= width; x += 4) {
+        const uint8_t* sp = srow + (int64_t)x * 3;
+        __m128i block = _mm_loadu_si128((const __m128i*)sp);
+        __m128i rbytes = _mm_shuffle_epi8(block, mask_r);
+        __m128i gbytes = _mm_shuffle_epi8(block, mask_g);
+        __m128i bbytes = _mm_shuffle_epi8(block, mask_b);
+
+        __m128 vr = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(rbytes));
+        __m128 vg = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(gbytes));
+        __m128 vb = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(bbytes));
+
+        __m128 tmp_r = _mm_fmadd_ps(vscale, vr, voffset);
+        __m128 tmp_g = _mm_fmadd_ps(vscale, vg, voffset);
+        __m128 tmp_b = _mm_fmadd_ps(vscale, vb, voffset);
+
+        float* dptr = drow + (int64_t)x * 3;
+        __m128 dst_r = _mm_i32gather_ps(dptr, idx_r, 4);
+        __m128 dst_g = _mm_i32gather_ps(dptr, idx_g, 4);
+        __m128 dst_b = _mm_i32gather_ps(dptr, idx_b, 4);
+
+        __m128 outR = _mm_fmadd_ps(valpha, dst_r, _mm_mul_ps(vbeta, tmp_r));
+        __m128 outG = _mm_fmadd_ps(valpha, dst_g, _mm_mul_ps(vbeta, tmp_g));
+        __m128 outB = _mm_fmadd_ps(valpha, dst_b, _mm_mul_ps(vbeta, tmp_b));
+
+        _mm_store_ps(out_r, outR);
+        _mm_store_ps(out_g, outG);
+        _mm_store_ps(out_b, outB);
+        for (int lane = 0; lane < 4; ++lane) {
+          float* pixel = dptr + lane * 3;
+          pixel[0] = out_r[lane];
+          pixel[1] = out_g[lane];
+          pixel[2] = out_b[lane];
+        }
+      }
+      for (; x < width; ++x) {
+        const int si = x * 3;
+        const int di = x * 3;
+        for (int c = 0; c < 3; ++c) {
+          float tmp = float(srow[si + c]) * scale + offset;
+          drow[di + c] = alpha * drow[di + c] + beta * tmp;
+        }
+      }
+    }
+    return;
+  }
+#endif
+  img_rgb_u8_to_f32_interleaved_scalar(
+    src + (int64_t)y0 * src_stride, src_stride,
+    (float*)(((uint8_t*)dst) + (int64_t)y0 * dst_stride), dst_stride,
+    width, (y1 - y0),
+    scale, offset, alpha, beta
+  );
+}
+
+static void img_rgb_planar_kernel_rows(
+  const uint8_t* src_r, int64_t src_r_stride,
+  const uint8_t* src_g, int64_t src_g_stride,
+  const uint8_t* src_b, int64_t src_b_stride,
+  float* dst_r, int64_t dst_r_stride,
+  float* dst_g, int64_t dst_g_stride,
+  float* dst_b, int64_t dst_b_stride,
+  int width, int y0, int y1,
+  float scale, float offset,
+  float alpha, float beta
+) {
+  img_rgb_u8_to_f32_planar_scalar(
+    src_r + (int64_t)y0 * src_r_stride, src_r_stride,
+    src_g + (int64_t)y0 * src_g_stride, src_g_stride,
+    src_b + (int64_t)y0 * src_b_stride, src_b_stride,
+    (float*)(((uint8_t*)dst_r) + (int64_t)y0 * dst_r_stride), dst_r_stride,
+    (float*)(((uint8_t*)dst_g) + (int64_t)y0 * dst_g_stride), dst_g_stride,
+    (float*)(((uint8_t*)dst_b) + (int64_t)y0 * dst_b_stride), dst_b_stride,
+    width, (y1 - y0),
+    scale, offset, alpha, beta
+  );
+}
+
 // =====================================================
 //  C-API
 // =====================================================
 HALO_API int halo_init_features() { halo_cpuid_init(); return 0; }
+HALO_API const char* halo_version() { return "HALO v0.5b"; }
 
 HALO_API int halo_query_features(int* out_sse2, int* out_avx2, int* out_avx512) {
   if (!out_sse2 || !out_avx2 || !out_avx512) return -1;
@@ -726,15 +1114,18 @@ HALO_API int halo_img_u8_to_f32_lut_axpby(
   if (width <= 0 || height <= 0) return -2;
   if (src_stride < width || dst_stride < (long long)width * 4) return -3;
 
-  const int64_t pixels  = (int64_t)width * height;
-  const int64_t bytes   = pixels * 5; // ~1B read + 4B write
-  const bool dst_al32   = is_aligned_32(dst);
-  bool allow_stream = g_streaming_enabled && dst_al32 && width >= 2048 && bytes >= (16ll<<20);
+  const int64_t pixels        = (int64_t)width * height;
+  const int64_t bytes         = pixels * 5; // ~1B read + 4B write
+  const int64_t row_work      = (int64_t)width * 5;
+  const bool dst_al32         = is_aligned_32(dst);
+  const bool dst_stride_al32  = ((dst_stride & 31ll) == 0ll);
+  const bool allow_aligned    = dst_al32 && dst_stride_al32;
+  bool allow_stream = should_use_streaming(width, bytes, dst_al32, dst_stride_al32);
 
   int t = std::max(1, g_threads);
   ensure_pool(t);
-  const bool big_enough = (bytes >= (16ll<<20)) && (height >= 2*t);
-  const bool do_mt = (use_mt != 0) && (t > 1) && big_enough;
+  ScheduleDecision sched = compute_schedule(width, height, t, row_work, bytes, use_mt != 0);
+  const bool do_mt = sched.do_mt;
 
   if (!do_mt) {
 #if HALO_X86
@@ -747,12 +1138,12 @@ HALO_API int halo_img_u8_to_f32_lut_axpby(
         float inter = b*scale + offset;
         used = img_u8_to_f32_lut_axpby_avx2_affine(
           (const uint8_t*)src, (int64_t)src_stride, dst, (int64_t)dst_stride,
-          width, height, slope, inter, alpha, beta, allow_stream
+          width, height, slope, inter, alpha, beta, allow_stream, allow_aligned
         );
       } else {
         used = img_u8_to_f32_lut_axpby_avx2_gather(
           (const uint8_t*)src, (int64_t)src_stride, dst, (int64_t)dst_stride,
-          width, height, lut256, scale, offset, alpha, beta, allow_stream
+          width, height, lut256, scale, offset, alpha, beta, allow_stream, allow_aligned
         );
       }
       if (used) _mm_sfence();
@@ -774,10 +1165,1127 @@ HALO_API int halo_img_u8_to_f32_lut_axpby(
         dst, (int64_t)dst_stride,
         width, y0, y1,
         lut256, scale, offset, alpha, beta,
-        allow_stream
+        allow_stream,
+        allow_aligned
       );
     },
-    /*min_rows_per_task=*/2
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+static inline int clamp_int(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static void box_blur_f32_scalar(
+  const float* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height,
+  int radius
+) {
+  if (radius <= 0) {
+    for (int y=0; y<height; ++y) {
+      const float* srow = (const float*)((const uint8_t*)src + y * src_stride);
+      float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+      std::memcpy(drow, srow, sizeof(float)*width);
+    }
+    return;
+  }
+  const int kernel = radius * 2 + 1;
+  std::vector<float> tmp((size_t)width * height, 0.0f);
+  for (int y=0; y<height; ++y) {
+    const float* srow = (const float*)((const uint8_t*)src + y * src_stride);
+    float* trow = tmp.data() + (size_t)y * width;
+    for (int x=0; x<width; ++x) {
+      float acc = 0.0f;
+      for (int k=-radius; k<=radius; ++k) {
+        int ix = clamp_int(x + k, 0, width-1);
+        acc += srow[ix];
+      }
+      trow[x] = acc / kernel;
+    }
+  }
+  for (int y=0; y<height; ++y) {
+    float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<width; ++x) {
+      float acc = 0.0f;
+      for (int k=-radius; k<=radius; ++k) {
+        int iy = clamp_int(y + k, 0, height-1);
+        acc += tmp[(size_t)iy * width + x];
+      }
+      drow[x] = acc / kernel;
+    }
+  }
+}
+
+static std::vector<float> make_gaussian_kernel(float sigma) {
+  int radius = std::max(1, (int)std::ceil(3.0f * sigma));
+  std::vector<float> w((size_t)radius * 2 + 1);
+  const float inv_sigma2 = 1.0f / (2.0f * sigma * sigma);
+  float sum = 0.0f;
+  for (int i=-radius; i<=radius; ++i) {
+    float val = std::exp(-float(i*i) * inv_sigma2);
+    w[(size_t)(i + radius)] = val;
+    sum += val;
+  }
+  for (float& v : w) v /= sum;
+  return w;
+}
+
+static void gaussian_blur_f32_scalar(
+  const float* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height,
+  float sigma
+) {
+  if (sigma <= 0.0f) {
+    for (int y=0; y<height; ++y) {
+      const float* srow = (const float*)((const uint8_t*)src + y * src_stride);
+      float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+      std::memcpy(drow, srow, sizeof(float)*width);
+    }
+    return;
+  }
+  std::vector<float> kernel = make_gaussian_kernel(sigma);
+  int radius = (int)kernel.size() / 2;
+  std::vector<float> tmp((size_t)width * height, 0.0f);
+  for (int y=0; y<height; ++y) {
+    const float* srow = (const float*)((const uint8_t*)src + y * src_stride);
+    float* trow = tmp.data() + (size_t)y * width;
+    for (int x=0; x<width; ++x) {
+      float acc = 0.0f;
+      for (int k=-radius; k<=radius; ++k) {
+        int ix = clamp_int(x + k, 0, width-1);
+        acc += srow[ix] * kernel[(size_t)(k + radius)];
+      }
+      trow[x] = acc;
+    }
+  }
+  for (int y=0; y<height; ++y) {
+    float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<width; ++x) {
+      float acc = 0.0f;
+      for (int k=-radius; k<=radius; ++k) {
+        int iy = clamp_int(y + k, 0, height-1);
+        acc += tmp[(size_t)iy * width + x] * kernel[(size_t)(k + radius)];
+      }
+      drow[x] = acc;
+    }
+  }
+}
+
+static void sobel_f32_scalar(
+  const float* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height
+) {
+  for (int y=0; y<height; ++y) {
+    float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<width; ++x) {
+      float gx = 0.0f;
+      float gy = 0.0f;
+      for (int ky=-1; ky<=1; ++ky) {
+        int sy = clamp_int(y + ky, 0, height-1);
+        const float* srow = (const float*)((const uint8_t*)src + sy * src_stride);
+        for (int kx=-1; kx<=1; ++kx) {
+          int sx = clamp_int(x + kx, 0, width-1);
+          float val = srow[sx];
+          int ix = kx + 1;
+          int iy = ky + 1;
+          static const int sobel_x[3][3] = {
+            {-1, 0, 1},
+            {-2, 0, 2},
+            {-1, 0, 1}
+          };
+          static const int sobel_y[3][3] = {
+            { 1,  2,  1},
+            { 0,  0,  0},
+            {-1, -2, -1}
+          };
+          gx += val * sobel_x[iy][ix];
+          gy += val * sobel_y[iy][ix];
+        }
+      }
+      drow[x] = std::sqrt(gx*gx + gy*gy);
+    }
+  }
+}
+
+static void resize_bilinear_f32_scalar(
+  const float* src, int64_t src_stride,
+  int src_w, int src_h,
+  float* dst, int64_t dst_stride,
+  int dst_w, int dst_h
+) {
+  const float scale_x = (src_w > 1) ? float(src_w - 1) / float(dst_w - 1) : 0.0f;
+  const float scale_y = (src_h > 1) ? float(src_h - 1) / float(dst_h - 1) : 0.0f;
+  for (int y=0; y<dst_h; ++y) {
+    float fy = scale_y * y;
+    int y0 = clamp_int((int)std::floor(fy), 0, src_h - 1);
+    int y1 = clamp_int(y0 + 1, 0, src_h - 1);
+    float wy = fy - y0;
+    const float* row0 = (const float*)((const uint8_t*)src + y0 * src_stride);
+    const float* row1 = (const float*)((const uint8_t*)src + y1 * src_stride);
+    float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<dst_w; ++x) {
+      float fx = scale_x * x;
+      int x0 = clamp_int((int)std::floor(fx), 0, src_w - 1);
+      int x1 = clamp_int(x0 + 1, 0, src_w - 1);
+      float wx = fx - x0;
+      float v0 = row0[x0] * (1.0f - wx) + row0[x1] * wx;
+      float v1 = row1[x0] * (1.0f - wx) + row1[x1] * wx;
+      drow[x] = v0 * (1.0f - wy) + v1 * wy;
+    }
+  }
+}
+
+static float cubic_interp(float a, float b, float c, float d, float t) {
+  float A = -0.5f*a + 1.5f*b - 1.5f*c + 0.5f*d;
+  float B = a - 2.5f*b + 2.0f*c - 0.5f*d;
+  float C = -0.5f*a + 0.5f*c;
+  float D = b;
+  return ((A*t + B)*t + C)*t + D;
+}
+
+static inline void catmull_rom_weights(float t, float out[4]) {
+  float t2 = t * t;
+  float t3 = t2 * t;
+  out[0] = -0.5f * t3 + t2 - 0.5f * t;
+  out[1] =  1.5f * t3 - 2.5f * t2 + 1.0f;
+  out[2] = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+  out[3] =  0.5f * t3 - 0.5f * t2;
+}
+
+static void resize_bicubic_f32_scalar(
+  const float* src, int64_t src_stride,
+  int src_w, int src_h,
+  float* dst, int64_t dst_stride,
+  int dst_w, int dst_h
+) {
+  const float scale_x = (float)src_w / (float)dst_w;
+  const float scale_y = (float)src_h / (float)dst_h;
+  for (int y=0; y<dst_h; ++y) {
+    float fy = (y + 0.5f) * scale_y - 0.5f;
+    int y1 = clamp_int((int)std::floor(fy), 0, src_h - 1);
+    float wy = fy - y1;
+    float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<dst_w; ++x) {
+      float fx = (x + 0.5f) * scale_x - 0.5f;
+      int x1 = clamp_int((int)std::floor(fx), 0, src_w - 1);
+      float wx = fx - x1;
+      float samples[4];
+      for (int k=0; k<4; ++k) {
+        int sy = clamp_int(y1 + k - 1, 0, src_h - 1);
+        const float* row = (const float*)((const uint8_t*)src + sy * src_stride);
+        float col[4];
+        for (int j=0; j<4; ++j) {
+          int sx = clamp_int(x1 + j - 1, 0, src_w - 1);
+          col[j] = row[sx];
+        }
+        samples[k] = cubic_interp(col[0], col[1], col[2], col[3], wx);
+      }
+      drow[x] = cubic_interp(samples[0], samples[1], samples[2], samples[3], wy);
+    }
+  }
+}
+
+static void relu_clamp_axpby_scalar(
+  const float* src, int64_t src_stride,
+  float* dst, int64_t dst_stride,
+  int width, int height,
+  float alpha, float beta,
+  float clamp_min, float clamp_max,
+  bool apply_relu
+) {
+  for (int y=0; y<height; ++y) {
+    const float* srow = (const float*)((const uint8_t*)src + y * src_stride);
+    float* drow = (float*)((uint8_t*)dst + y * dst_stride);
+    for (int x=0; x<width; ++x) {
+      float val = alpha * drow[x] + beta * srow[x];
+      if (apply_relu && val < 0.0f) val = 0.0f;
+      if (val < clamp_min) val = clamp_min;
+      if (val > clamp_max) val = clamp_max;
+      drow[x] = val;
+    }
+  }
+}
+
+HALO_API int halo_img_u16_to_f32_axpby(
+  const unsigned short* src, long long src_stride,
+  float* dst,               long long dst_stride,
+  int width, int height,
+  int bit_depth,
+  float scale, float offset,
+  float alpha, float beta,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_stride < (long long)width * 2 || dst_stride < (long long)width * 4) return -3;
+  if (bit_depth <= 0 || bit_depth > 16) return -4;
+
+  const uint16_t mask = (bit_depth == 16) ? 0xFFFFu : (uint16_t)((1u << bit_depth) - 1u);
+  const float inv_max = 1.0f / float((bit_depth == 16) ? 65535.0f : float((1u << bit_depth) - 1u));
+
+  const int64_t row_work = (int64_t)width * 6;
+  const int64_t total_bytes = row_work * height;
+
+  const bool dst_al32        = is_aligned_32(dst);
+  const bool dst_stride_al32 = ((dst_stride & 31ll) == 0ll);
+  const bool allow_aligned   = dst_al32 && dst_stride_al32;
+  bool allow_stream = should_use_streaming(width, total_bytes, dst_al32, dst_stride_al32);
+
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  if (!sched.do_mt) {
+#if HALO_X86
+    if (g_has_avx2) {
+      bool used = img_u16_to_f32_axpby_avx2(
+        (const uint16_t*)src, (int64_t)src_stride,
+        dst, (int64_t)dst_stride,
+        width, height,
+        mask, inv_max, scale, offset, alpha, beta,
+        allow_stream, allow_aligned
+      );
+      if (used) _mm_sfence();
+      return 0;
+    }
+#endif
+    img_u16_to_f32_axpby_scalar(
+      (const uint16_t*)src, (int64_t)src_stride,
+      dst, (int64_t)dst_stride,
+      width, height,
+      mask, inv_max, scale, offset, alpha, beta
+    );
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    [&](int y0, int y1){
+      img_u16_kernel_rows(
+        (const uint16_t*)src, (int64_t)src_stride,
+        dst, (int64_t)dst_stride,
+        width, y0, y1,
+        mask, inv_max,
+        scale, offset, alpha, beta,
+        allow_stream,
+        allow_aligned
+      );
+    },
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_img_rgb_u8_to_f32_interleaved(
+  const unsigned char* src, long long src_stride,
+  float* dst,               long long dst_stride,
+  int width, int height,
+  float scale, float offset,
+  float alpha, float beta,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_stride < (long long)width * 3 || dst_stride < (long long)width * 3 * 4) return -3;
+
+  const int64_t row_work = (int64_t)width * 15;
+  const int64_t total_bytes = row_work * height;
+
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  if (!sched.do_mt) {
+    img_rgb_u8_to_f32_interleaved_scalar(
+      src, (int64_t)src_stride,
+      dst, (int64_t)dst_stride,
+      width, height,
+      scale, offset, alpha, beta
+    );
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    [&](int y0, int y1){
+      img_rgb_interleaved_kernel_rows(
+        src, (int64_t)src_stride,
+        dst, (int64_t)dst_stride,
+        width, y0, y1,
+        scale, offset, alpha, beta
+      );
+    },
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_img_rgb_u8_to_f32_planar(
+  const unsigned char* src_r, long long src_r_stride,
+  const unsigned char* src_g, long long src_g_stride,
+  const unsigned char* src_b, long long src_b_stride,
+  float* dst_r, long long dst_r_stride,
+  float* dst_g, long long dst_g_stride,
+  float* dst_b, long long dst_b_stride,
+  int width, int height,
+  float scale, float offset,
+  float alpha, float beta,
+  int use_mt
+) {
+  if (!src_r || !src_g || !src_b || !dst_r || !dst_g || !dst_b) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_r_stride < width || src_g_stride < width || src_b_stride < width) return -3;
+  if (dst_r_stride < (long long)width * 4 || dst_g_stride < (long long)width * 4 || dst_b_stride < (long long)width * 4) return -4;
+
+  const int64_t row_work = (int64_t)width * 15;
+  const int64_t total_bytes = row_work * height;
+
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  if (!sched.do_mt) {
+    img_rgb_u8_to_f32_planar_scalar(
+      src_r, (int64_t)src_r_stride,
+      src_g, (int64_t)src_g_stride,
+      src_b, (int64_t)src_b_stride,
+      dst_r, (int64_t)dst_r_stride,
+      dst_g, (int64_t)dst_g_stride,
+      dst_b, (int64_t)dst_b_stride,
+      width, height,
+      scale, offset, alpha, beta
+    );
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    [&](int y0, int y1){
+      img_rgb_planar_kernel_rows(
+        src_r, (int64_t)src_r_stride,
+        src_g, (int64_t)src_g_stride,
+        src_b, (int64_t)src_b_stride,
+        dst_r, (int64_t)dst_r_stride,
+        dst_g, (int64_t)dst_g_stride,
+        dst_b, (int64_t)dst_b_stride,
+        width, y0, y1,
+        scale, offset, alpha, beta
+      );
+    },
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_box_blur_f32(
+  const float* src, long long src_stride,
+  float* dst,       long long dst_stride,
+  int width, int height,
+  int radius,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_stride < (long long)width * 4 || dst_stride < (long long)width * 4) return -3;
+  if (radius < 0) return -4;
+
+  const int64_t row_work = (int64_t)width * (8 + std::max(1, radius) * 4);
+  const int64_t total_bytes = row_work * height;
+
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  std::vector<float> tmp((size_t)width * height, 0.0f);
+  const int kernel = radius * 2 + 1;
+  const float inv_kernel = 1.0f / (float)kernel;
+
+  auto horizontal = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      const float* srow = (const float*)((const uint8_t*)src + (int64_t)y * src_stride);
+      float* trow = tmp.data() + (size_t)y * width;
+#if HALO_X86
+      if (g_has_avx2 && width >= 8) {
+        const __m256 vnorm = _mm256_set1_ps(inv_kernel);
+        int x = 0;
+        int edge = std::min(width, radius);
+        for (; x < edge; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int ix = clamp_int(x + k, 0, width-1);
+            acc += srow[ix];
+          }
+          trow[x] = acc * inv_kernel;
+        }
+        int interior_end = width - radius;
+        if (interior_end < edge) interior_end = edge;
+        for (; x + 8 <= interior_end; x += 8) {
+          __m256 acc = _mm256_setzero_ps();
+          for (int k=-radius; k<=radius; ++k) {
+            __m256 vals = _mm256_loadu_ps(srow + x + k);
+            acc = _mm256_add_ps(acc, vals);
+          }
+          _mm256_storeu_ps(trow + x, _mm256_mul_ps(acc, vnorm));
+        }
+        for (; x < width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int ix = clamp_int(x + k, 0, width-1);
+            acc += srow[ix];
+          }
+          trow[x] = acc * inv_kernel;
+        }
+      } else
+#endif
+      {
+        for (int x=0; x<width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int ix = clamp_int(x + k, 0, width-1);
+            acc += srow[ix];
+          }
+          trow[x] = acc * inv_kernel;
+        }
+      }
+    }
+  };
+
+  auto vertical = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+#if HALO_X86
+      if (g_has_avx2 && width >= 8) {
+        const __m256 vnorm = _mm256_set1_ps(inv_kernel);
+        int x = 0;
+        for (; x + 8 <= width; x += 8) {
+          __m256 acc = _mm256_setzero_ps();
+          for (int k=-radius; k<=radius; ++k) {
+            int iy = clamp_int(y + k, 0, height-1);
+            const float* srow = tmp.data() + (size_t)iy * width;
+            __m256 vals = _mm256_loadu_ps(srow + x);
+            acc = _mm256_add_ps(acc, vals);
+          }
+          _mm256_storeu_ps(drow + x, _mm256_mul_ps(acc, vnorm));
+        }
+        for (; x < width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int iy = clamp_int(y + k, 0, height-1);
+            acc += tmp[(size_t)iy * width + x];
+          }
+          drow[x] = acc * inv_kernel;
+        }
+      } else
+#endif
+      {
+        for (int x=0; x<width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int iy = clamp_int(y + k, 0, height-1);
+            acc += tmp[(size_t)iy * width + x];
+          }
+          drow[x] = acc * inv_kernel;
+        }
+      }
+    }
+  };
+
+  if (!sched.do_mt) {
+    horizontal(0, height);
+    vertical(0, height);
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    horizontal,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    vertical,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_gaussian_blur_f32(
+  const float* src, long long src_stride,
+  float* dst,       long long dst_stride,
+  int width, int height,
+  float sigma,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_stride < (long long)width * 4 || dst_stride < (long long)width * 4) return -3;
+  if (sigma < 0.0f) return -4;
+
+  if (sigma == 0.0f) {
+    for (int y=0; y<height; ++y) {
+      const float* srow = (const float*)((const uint8_t*)src + (int64_t)y * src_stride);
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+      std::memcpy(drow, srow, sizeof(float)*width);
+    }
+    return 0;
+  }
+
+  std::vector<float> kernel = make_gaussian_kernel(sigma);
+  int radius = (int)kernel.size() / 2;
+  const float* kernel_data = kernel.data();
+
+  const int64_t row_work = (int64_t)width * (8 + (radius * 4));
+  const int64_t total_bytes = row_work * height;
+
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  std::vector<float> tmp((size_t)width * height, 0.0f);
+
+  auto horizontal = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      const float* srow = (const float*)((const uint8_t*)src + (int64_t)y * src_stride);
+      float* trow = tmp.data() + (size_t)y * width;
+#if HALO_X86
+      if (g_has_avx2 && width >= 8) {
+        int x = 0;
+        int edge = std::min(width, radius);
+        for (; x < edge; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int ix = clamp_int(x + k, 0, width-1);
+            acc += srow[ix] * kernel_data[k + radius];
+          }
+          trow[x] = acc;
+        }
+        int interior_end = width - radius;
+        if (interior_end < edge) interior_end = edge;
+        for (; x + 8 <= interior_end; x += 8) {
+          __m256 vacc = _mm256_setzero_ps();
+          for (int k=-radius; k<=radius; ++k) {
+            __m256 vals = _mm256_loadu_ps(srow + x + k);
+            __m256 wk = _mm256_set1_ps(kernel_data[k + radius]);
+            vacc = _mm256_fmadd_ps(vals, wk, vacc);
+          }
+          _mm256_storeu_ps(trow + x, vacc);
+        }
+        for (; x < width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int ix = clamp_int(x + k, 0, width-1);
+            acc += srow[ix] * kernel_data[k + radius];
+          }
+          trow[x] = acc;
+        }
+      } else
+#endif
+      {
+        for (int x=0; x<width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int ix = clamp_int(x + k, 0, width-1);
+            acc += srow[ix] * kernel_data[k + radius];
+          }
+          trow[x] = acc;
+        }
+      }
+    }
+  };
+
+  auto vertical = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+#if HALO_X86
+      if (g_has_avx2 && width >= 8) {
+        int x = 0;
+        for (; x + 8 <= width; x += 8) {
+          __m256 vacc = _mm256_setzero_ps();
+          for (int k=-radius; k<=radius; ++k) {
+            int iy = clamp_int(y + k, 0, height-1);
+            const float* srow = tmp.data() + (size_t)iy * width;
+            __m256 vals = _mm256_loadu_ps(srow + x);
+            __m256 wk = _mm256_set1_ps(kernel_data[k + radius]);
+            vacc = _mm256_fmadd_ps(vals, wk, vacc);
+          }
+          _mm256_storeu_ps(drow + x, vacc);
+        }
+        for (; x < width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int iy = clamp_int(y + k, 0, height-1);
+            acc += tmp[(size_t)iy * width + x] * kernel_data[k + radius];
+          }
+          drow[x] = acc;
+        }
+      } else
+#endif
+      {
+        for (int x=0; x<width; ++x) {
+          float acc = 0.0f;
+          for (int k=-radius; k<=radius; ++k) {
+            int iy = clamp_int(y + k, 0, height-1);
+            acc += tmp[(size_t)iy * width + x] * kernel_data[k + radius];
+          }
+          drow[x] = acc;
+        }
+      }
+    }
+  };
+
+  if (!sched.do_mt) {
+    horizontal(0, height);
+    vertical(0, height);
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    horizontal,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    vertical,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_sobel_f32(
+  const float* src, long long src_stride,
+  float* dst,       long long dst_stride,
+  int width, int height,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_stride < (long long)width * 4 || dst_stride < (long long)width * 4) return -3;
+
+  const int64_t row_work = (int64_t)width * 16;
+  const int64_t total_bytes = row_work * height;
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  static const int sobel_x_kernel[3][3] = {
+    {-1, 0, 1},
+    {-2, 0, 2},
+    {-1, 0, 1}
+  };
+  static const int sobel_y_kernel[3][3] = {
+    { 1,  2,  1},
+    { 0,  0,  0},
+    {-1, -2, -1}
+  };
+
+  auto worker = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+#if HALO_X86
+      if (g_has_avx2 && width >= 8 && y > 0 && y < height-1) {
+        const float* rowm1 = (const float*)((const uint8_t*)src + (int64_t)(y-1) * src_stride);
+        const float* row0  = (const float*)((const uint8_t*)src + (int64_t)y     * src_stride);
+        const float* rowp1 = (const float*)((const uint8_t*)src + (int64_t)(y+1) * src_stride);
+        int x = 0;
+        for (; x < 1; ++x) {
+          float gx = 0.0f;
+          float gy = 0.0f;
+          for (int ky=-1; ky<=1; ++ky) {
+            int sy = clamp_int(y + ky, 0, height-1);
+            const float* srow = (const float*)((const uint8_t*)src + (int64_t)sy * src_stride);
+            for (int kx=-1; kx<=1; ++kx) {
+              int sx = clamp_int(x + kx, 0, width-1);
+              float val = srow[sx];
+              gx += val * sobel_x_kernel[ky+1][kx+1];
+              gy += val * sobel_y_kernel[ky+1][kx+1];
+            }
+          }
+          drow[x] = std::sqrt(gx*gx + gy*gy);
+        }
+        int limit = width - 1;
+        const __m256 c1 = _mm256_set1_ps(1.0f);
+        const __m256 c2 = _mm256_set1_ps(2.0f);
+        for (; x + 8 <= limit; x += 8) {
+          __m256 top_l = _mm256_loadu_ps(rowm1 + x - 1);
+          __m256 top_c = _mm256_loadu_ps(rowm1 + x);
+          __m256 top_r = _mm256_loadu_ps(rowm1 + x + 1);
+          __m256 mid_l = _mm256_loadu_ps(row0  + x - 1);
+          __m256 mid_r = _mm256_loadu_ps(row0  + x + 1);
+          __m256 bot_l = _mm256_loadu_ps(rowp1 + x - 1);
+          __m256 bot_c = _mm256_loadu_ps(rowp1 + x);
+          __m256 bot_r = _mm256_loadu_ps(rowp1 + x + 1);
+
+          __m256 gx = _mm256_setzero_ps();
+          gx = _mm256_fnmadd_ps(top_l, c1, gx);
+          gx = _mm256_fnmadd_ps(mid_l, c2, gx);
+          gx = _mm256_fnmadd_ps(bot_l, c1, gx);
+          gx = _mm256_fmadd_ps(top_r, c1, gx);
+          gx = _mm256_fmadd_ps(mid_r, c2, gx);
+          gx = _mm256_fmadd_ps(bot_r, c1, gx);
+
+          __m256 gy = _mm256_setzero_ps();
+          gy = _mm256_fmadd_ps(top_l, c1, gy);
+          gy = _mm256_fmadd_ps(top_c, c2, gy);
+          gy = _mm256_fmadd_ps(top_r, c1, gy);
+          gy = _mm256_fnmadd_ps(bot_l, c1, gy);
+          gy = _mm256_fnmadd_ps(bot_c, c2, gy);
+          gy = _mm256_fnmadd_ps(bot_r, c1, gy);
+
+          __m256 mag = _mm256_add_ps(_mm256_mul_ps(gx, gx), _mm256_mul_ps(gy, gy));
+          mag = _mm256_sqrt_ps(mag);
+          _mm256_storeu_ps(drow + x, mag);
+        }
+        for (; x < width; ++x) {
+          float gx = 0.0f;
+          float gy = 0.0f;
+          for (int ky=-1; ky<=1; ++ky) {
+            int sy = clamp_int(y + ky, 0, height-1);
+            const float* srow = (const float*)((const uint8_t*)src + (int64_t)sy * src_stride);
+            for (int kx=-1; kx<=1; ++kx) {
+              int sx = clamp_int(x + kx, 0, width-1);
+              float val = srow[sx];
+              gx += val * sobel_x_kernel[ky+1][kx+1];
+              gy += val * sobel_y_kernel[ky+1][kx+1];
+            }
+          }
+          drow[x] = std::sqrt(gx*gx + gy*gy);
+        }
+        continue;
+      }
+#endif
+      for (int x=0; x<width; ++x) {
+        float gx = 0.0f;
+        float gy = 0.0f;
+        for (int ky=-1; ky<=1; ++ky) {
+          int sy = clamp_int(y + ky, 0, height-1);
+          const float* srow = (const float*)((const uint8_t*)src + (int64_t)sy * src_stride);
+          for (int kx=-1; kx<=1; ++kx) {
+            int sx = clamp_int(x + kx, 0, width-1);
+            float val = srow[sx];
+            gx += val * sobel_x_kernel[ky+1][kx+1];
+            gy += val * sobel_y_kernel[ky+1][kx+1];
+          }
+        }
+        drow[x] = std::sqrt(gx*gx + gy*gy);
+      }
+    }
+  };
+
+  if (!sched.do_mt) {
+    worker(0, height);
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    worker,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_resize_bilinear_f32(
+  const float* src, long long src_stride,
+  int src_width, int src_height,
+  float* dst, long long dst_stride,
+  int dst_width, int dst_height,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (src_width <= 0 || src_height <= 0 || dst_width <= 0 || dst_height <= 0) return -2;
+  if (src_stride < (long long)src_width * 4 || dst_stride < (long long)dst_width * 4) return -3;
+
+  const int64_t row_work = (int64_t)dst_width * 16;
+  const int64_t total_bytes = row_work * dst_height;
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(dst_width, dst_height, threads, row_work, total_bytes, use_mt != 0);
+
+  std::vector<int>  x0_idx(dst_width);
+  std::vector<int>  x1_idx(dst_width);
+  std::vector<float> wx_factor(dst_width);
+  const float scale_x = (src_width > 1 && dst_width > 1) ? float(src_width - 1) / float(dst_width - 1) : 0.0f;
+  for (int x=0; x<dst_width; ++x) {
+    float fx = scale_x * x;
+    int x0s = clamp_int((int)std::floor(fx), 0, src_width - 1);
+    int x1s = clamp_int(x0s + 1, 0, src_width - 1);
+    x0_idx[x] = x0s;
+    x1_idx[x] = x1s;
+    wx_factor[x] = fx - (float)x0s;
+  }
+
+  const float scale_y = (src_height > 1 && dst_height > 1) ? float(src_height - 1) / float(dst_height - 1) : 0.0f;
+
+  auto worker = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      float fy = scale_y * y;
+      int y0s = clamp_int((int)std::floor(fy), 0, src_height - 1);
+      int y1s = clamp_int(y0s + 1, 0, src_height - 1);
+      float wy = fy - (float)y0s;
+      const float* row0 = (const float*)((const uint8_t*)src + (int64_t)y0s * src_stride);
+      const float* row1 = (const float*)((const uint8_t*)src + (int64_t)y1s * src_stride);
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+#if HALO_X86
+      if (g_has_avx2 && dst_width >= 8) {
+        const __m256 wy_v   = _mm256_set1_ps(wy);
+        const __m256 one    = _mm256_set1_ps(1.0f);
+        const __m256 w1_y   = _mm256_sub_ps(one, wy_v);
+        int x = 0;
+        for (; x + 8 <= dst_width; x += 8) {
+          __m256 wx = _mm256_loadu_ps(wx_factor.data() + x);
+          __m256 w0 = _mm256_sub_ps(one, wx);
+          __m256 w1 = wx;
+          __m256i ix0 = _mm256_loadu_si256((const __m256i*)(x0_idx.data() + x));
+          __m256i ix1 = _mm256_loadu_si256((const __m256i*)(x1_idx.data() + x));
+          __m256 top0 = _mm256_i32gather_ps(row0, ix0, 4);
+          __m256 top1 = _mm256_i32gather_ps(row0, ix1, 4);
+          __m256 bot0 = _mm256_i32gather_ps(row1, ix0, 4);
+          __m256 bot1 = _mm256_i32gather_ps(row1, ix1, 4);
+          __m256 top = _mm256_fmadd_ps(top1, w1, _mm256_mul_ps(top0, w0));
+          __m256 bot = _mm256_fmadd_ps(bot1, w1, _mm256_mul_ps(bot0, w0));
+          __m256 out = _mm256_fmadd_ps(bot, wy_v, _mm256_mul_ps(top, w1_y));
+          _mm256_storeu_ps(drow + x, out);
+        }
+        for (; x < dst_width; ++x) {
+          int x0s = x0_idx[x];
+          int x1s = x1_idx[x];
+          float wx = wx_factor[x];
+          float w0 = 1.0f - wx;
+          float top = row0[x0s] * w0 + row0[x1s] * wx;
+          float bot = row1[x0s] * w0 + row1[x1s] * wx;
+          drow[x] = top * (1.0f - wy) + bot * wy;
+        }
+      } else
+#endif
+      {
+        for (int x=0; x<dst_width; ++x) {
+          int x0s = x0_idx[x];
+          int x1s = x1_idx[x];
+          float wx = wx_factor[x];
+          float w0 = 1.0f - wx;
+          float top = row0[x0s] * w0 + row0[x1s] * wx;
+          float bot = row1[x0s] * w0 + row1[x1s] * wx;
+          drow[x] = top * (1.0f - wy) + bot * wy;
+        }
+      }
+    }
+  };
+
+  if (!sched.do_mt) {
+    worker(0, dst_height);
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    dst_height,
+    worker,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_resize_bicubic_f32(
+  const float* src, long long src_stride,
+  int src_width, int src_height,
+  float* dst, long long dst_stride,
+  int dst_width, int dst_height,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (src_width <= 0 || src_height <= 0 || dst_width <= 0 || dst_height <= 0) return -2;
+  if (src_stride < (long long)src_width * 4 || dst_stride < (long long)dst_width * 4) return -3;
+
+  const int64_t row_work = (int64_t)dst_width * 32;
+  const int64_t total_bytes = row_work * dst_height;
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(dst_width, dst_height, threads, row_work, total_bytes, use_mt != 0);
+
+  std::vector<int>   x_idx0(dst_width), x_idx1(dst_width), x_idx2(dst_width), x_idx3(dst_width);
+  std::vector<float> x_w0(dst_width),   x_w1(dst_width),   x_w2(dst_width),   x_w3(dst_width);
+  const float inv_dst_w = (dst_width > 0) ? 1.0f / (float)dst_width : 0.0f;
+  for (int x=0; x<dst_width; ++x) {
+    float fx = (float)src_width * (float(x) + 0.5f) * inv_dst_w - 0.5f;
+    int x1 = clamp_int((int)std::floor(fx), 0, src_width - 1);
+    float tx = fx - (float)x1;
+    float w[4];
+    catmull_rom_weights(tx, w);
+    x_idx0[x] = clamp_int(x1 - 1, 0, src_width - 1);
+    x_idx1[x] = clamp_int(x1 + 0, 0, src_width - 1);
+    x_idx2[x] = clamp_int(x1 + 1, 0, src_width - 1);
+    x_idx3[x] = clamp_int(x1 + 2, 0, src_width - 1);
+    x_w0[x] = w[0];
+    x_w1[x] = w[1];
+    x_w2[x] = w[2];
+    x_w3[x] = w[3];
+  }
+
+  auto worker = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      float fy = (float)src_height * (float(y) + 0.5f) / (float)dst_height - 0.5f;
+      int y1s = clamp_int((int)std::floor(fy), 0, src_height - 1);
+      float wy = fy - y1s;
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+#if HALO_X86
+      if (g_has_avx2 && dst_width >= 8) {
+        int sy_idx[4];
+        float wy_weights[4];
+        catmull_rom_weights(wy, wy_weights);
+        for (int k=0; k<4; ++k) {
+          sy_idx[k] = clamp_int(y1s + k - 1, 0, src_height - 1);
+        }
+        int x = 0;
+        for (; x + 8 <= dst_width; x += 8) {
+          __m256 accum = _mm256_setzero_ps();
+          __m256 w0 = _mm256_loadu_ps(x_w0.data() + x);
+          __m256 w1 = _mm256_loadu_ps(x_w1.data() + x);
+          __m256 w2 = _mm256_loadu_ps(x_w2.data() + x);
+          __m256 w3 = _mm256_loadu_ps(x_w3.data() + x);
+          __m256i ix0 = _mm256_loadu_si256((const __m256i*)(x_idx0.data() + x));
+          __m256i ix1 = _mm256_loadu_si256((const __m256i*)(x_idx1.data() + x));
+          __m256i ix2 = _mm256_loadu_si256((const __m256i*)(x_idx2.data() + x));
+          __m256i ix3 = _mm256_loadu_si256((const __m256i*)(x_idx3.data() + x));
+          for (int ky=0; ky<4; ++ky) {
+            const float* row = (const float*)((const uint8_t*)src + (int64_t)sy_idx[ky] * src_stride);
+            __m256 s0 = _mm256_i32gather_ps(row, ix0, 4);
+            __m256 s1 = _mm256_i32gather_ps(row, ix1, 4);
+            __m256 s2 = _mm256_i32gather_ps(row, ix2, 4);
+            __m256 s3 = _mm256_i32gather_ps(row, ix3, 4);
+            __m256 lane = _mm256_mul_ps(s0, w0);
+            lane = _mm256_fmadd_ps(s1, w1, lane);
+            lane = _mm256_fmadd_ps(s2, w2, lane);
+            lane = _mm256_fmadd_ps(s3, w3, lane);
+            __m256 wyv = _mm256_set1_ps(wy_weights[ky]);
+            accum = _mm256_fmadd_ps(lane, wyv, accum);
+          }
+          _mm256_storeu_ps(drow + x, accum);
+        }
+        for (; x < dst_width; ++x) {
+          float col_vals[4];
+          for (int ky=0; ky<4; ++ky) {
+            const float* row = (const float*)((const uint8_t*)src + (int64_t)sy_idx[ky] * src_stride);
+            float val = row[x_idx0[x]] * x_w0[x]
+                      + row[x_idx1[x]] * x_w1[x]
+                      + row[x_idx2[x]] * x_w2[x]
+                      + row[x_idx3[x]] * x_w3[x];
+            col_vals[ky] = val;
+          }
+          float result = 0.0f;
+          for (int ky=0; ky<4; ++ky) {
+            result += col_vals[ky] * wy_weights[ky];
+          }
+          drow[x] = result;
+        }
+        continue;
+      }
+#endif
+      for (int x=0; x<dst_width; ++x) {
+        float fx = (float)src_width * (float(x) + 0.5f) / (float)dst_width - 0.5f;
+        int x1s = clamp_int((int)std::floor(fx), 0, src_width - 1);
+        float wx = fx - x1s;
+        float samples[4];
+        for (int k=0; k<4; ++k) {
+          int sy = clamp_int(y1s + k - 1, 0, src_height - 1);
+          const float* row = (const float*)((const uint8_t*)src + (int64_t)sy * src_stride);
+          float cols[4];
+          for (int j=0; j<4; ++j) {
+            int sx = clamp_int(x1s + j - 1, 0, src_width - 1);
+            cols[j] = row[sx];
+          }
+          samples[k] = cubic_interp(cols[0], cols[1], cols[2], cols[3], wx);
+        }
+        drow[x] = cubic_interp(samples[0], samples[1], samples[2], samples[3], wy);
+      }
+    }
+  };
+
+  if (!sched.do_mt) {
+    worker(0, dst_height);
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    dst_height,
+    worker,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
+  );
+
+  return 0;
+}
+
+HALO_API int halo_relu_clamp_axpby_f32(
+  const float* src, long long src_stride,
+  float* dst,       long long dst_stride,
+  int width, int height,
+  float alpha, float beta,
+  float clamp_min, float clamp_max,
+  int apply_relu,
+  int use_mt
+) {
+  if (!src || !dst) return -1;
+  if (width <= 0 || height <= 0) return -2;
+  if (src_stride < (long long)width * 4 || dst_stride < (long long)width * 4) return -3;
+  if (clamp_min > clamp_max) return -4;
+
+  const int64_t row_work = (int64_t)width * 16;
+  const int64_t total_bytes = row_work * height;
+  int threads = std::max(1, g_threads);
+  ensure_pool(threads);
+  ScheduleDecision sched = compute_schedule(width, height, threads, row_work, total_bytes, use_mt != 0);
+
+  auto worker = [&](int y0, int y1){
+    for (int y=y0; y<y1; ++y) {
+      const float* srow = (const float*)((const uint8_t*)src + (int64_t)y * src_stride);
+      float* drow = (float*)((uint8_t*)dst + (int64_t)y * dst_stride);
+      for (int x=0; x<width; ++x) {
+        float val = alpha * drow[x] + beta * srow[x];
+        if (apply_relu && val < 0.0f) val = 0.0f;
+        if (val < clamp_min) val = clamp_min;
+        if (val > clamp_max) val = clamp_max;
+        drow[x] = val;
+      }
+    }
+  };
+
+  if (!sched.do_mt) {
+    worker(0, height);
+    return 0;
+  }
+
+  ThreadPool::instance().parallel_for_rows(
+    height,
+    worker,
+    /*min_rows_per_task=*/sched.min_rows,
+    /*chunk_rows_hint=*/sched.chunk_hint
   );
 
   return 0;
