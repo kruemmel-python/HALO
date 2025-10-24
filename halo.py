@@ -285,7 +285,8 @@ class AlignedBuffer:
         self.alignment = alignment
 
     def view(self, fmt: str = 'B') -> memoryview:
-        mv = memoryview(self._raw)[self._offset:self._offset + self.size]
+        base = memoryview(self._raw).cast('B')
+        mv = base[self._offset:self._offset + self.size]
         return mv.cast(fmt) if fmt != 'B' else mv
 
 def make_aligned_u8_buffer(width: int, height: int, *, alignment: int = 64, stride_bytes: int | None = None) -> tuple[memoryview, int]:
