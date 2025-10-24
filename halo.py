@@ -867,22 +867,37 @@ class PlotLayout:
     def plot_line(self, xs: Sequence[float], ys: Sequence[float], color: float = 1.0,
                   *, tick_count: int = 5, x_label: str = "", y_label: str = "",
                   title: str = "") -> None:
-        if len(xs) != len(ys):
+        # NumPy-robust: in Listen konvertieren
+        try:
+            xs_list = list(xs)
+            ys_list = list(ys)
+        except TypeError:
+            xs_list = [v for v in xs]
+            ys_list = [v for v in ys]
+
+        if len(xs_list) != len(ys_list):
             raise ValueError("xs und ys müssen gleiche Länge haben")
-        if not xs:
+        if len(xs_list) == 0:
             return
+
         x0, y0, x1, y1 = self._axis_bounds()
-        min_x = min(xs); max_x = max(xs)
-        min_y = min(ys); max_y = max(ys)
+
+        # Min/Max robust (NumPy oder Python-Listen)
+        min_x = float(min(xs_list)); max_x = float(max(xs_list))
+        min_y = float(min(ys_list)); max_y = float(max(ys_list))
+
         span_x = max(max_x - min_x, 1e-5)
         span_y = max(max_y - min_y, 1e-5)
+
         points = []
-        for vx, vy in zip(xs, ys):
-            sx = x0 + (vx - min_x) / span_x * (x1 - x0)
-            sy = y1 - (vy - min_y) / span_y * (y1 - y0)
+        for vx, vy in zip(xs_list, ys_list):
+            sx = x0 + (float(vx) - min_x) / span_x * (x1 - x0)
+            sy = y1 - (float(vy) - min_y) / span_y * (y1 - y0)
             points.append((sx, sy))
+
         self.canvas.stroke_polyline(points, color, width=1.5)
         self.draw_axes(x_label=x_label, y_label=y_label, title=title, tick_count=tick_count)
+
 
 
 def _to_c_float_ptr(buf: ArrayLikeFloat) -> Tuple[C.POINTER(C.c_float), int]:
