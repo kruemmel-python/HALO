@@ -275,7 +275,8 @@ class AlignedBuffer:
     def __init__(self, size: int, alignment: int):
         if alignment <= 0:
             raise ValueError("alignment muss > 0 sein.")
-        raw = C.create_string_buffer(size + alignment)
+        buf_type = C.c_ubyte * (size + alignment)
+        raw = buf_type()
         addr = C.addressof(raw)
         offset = (alignment - (addr % alignment)) % alignment
         self._raw = raw
