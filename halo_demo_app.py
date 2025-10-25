@@ -2,7 +2,7 @@ import gradio as gr
 import numpy as np
 import math
 import ctypes as C
-import cv2 
+import cv2
 from typing import Optional, Tuple, List, Union, Any, Literal
 from array import array
 import os
@@ -22,14 +22,16 @@ HALO_Buffer = ArrayLikeFloat
 try:
     from halo import HALO, make_aligned_f32_buffer
     from halo_extensions import (
-        bilateral_filter, canny_edge_detector, convert_colorspace, 
+        bilateral_filter, canny_edge_detector, convert_colorspace,
         morphological_operation as hl_morph_op, warp_affine, AffineTransform
     )
+    from halo_gpu import HALOGPU
     
     def _to_c_f32_ptr_2d(buf: HALO_Buffer, *args, **kwargs) -> HALO_Buffer:
         return buf
 
     halo_instance = HALO(threads=4)
+    gpu_instance = HALOGPU()
     print(f"HALO-Bibliothek ({halo_instance.features}) erfolgreich geladen.")
     
 except ImportError as e:
@@ -44,6 +46,8 @@ except ImportError as e:
     hl_morph_op = bilateral_filter = canny_edge_detector = convert_colorspace = warp_affine = DummyExtensions().dummy
     AffineTransform = object()
     make_aligned_f32_buffer = lambda *args, **kwargs: (memoryview(bytearray(1)), 4)
+    from halo_gpu import HALOGPU  # type: ignore
+    gpu_instance = HALOGPU(prefer_gpu=False)
 
 
 # --- HALO-Bridge Logik ---
@@ -105,6 +109,34 @@ def _convert_float_channels_to_image(channels_info: List[Tuple[HALO_Buffer, int,
             return np.stack([img_final] * 3, axis=-1)
     return img_final
 
+
+def _gpu_available() -> bool:
+    try:
+        backend = gpu_instance.backend
+    except Exception:
+        return False
+    return gpu_instance.prefer_gpu and backend is not np
+
+
+def _apply_backend_filter(
+    img: Optional[np.ndarray],
+    cpu_wrapper: callable,
+    gpu_func: Optional[callable],
+    use_gpu: bool,
+) -> Optional[np.ndarray]:
+    if img is None:
+        return None
+    if use_gpu and gpu_func is not None and _gpu_available():
+        dtype_info = _get_dtype_info(img)
+        img_f32 = _normalize_to_float32(img, dtype_info)
+        try:
+            result_f32 = gpu_func(img_f32)
+            result_f32 = np.asarray(result_f32, dtype=np.float32)
+            return _denormalize_from_float32(result_f32, dtype_info)
+        except Exception as exc:
+            print(f"GPU-Filter fehlgeschlagen, verwende CPU-Pfad: {exc}")
+    return apply_halo_filter_per_channel(img, cpu_wrapper)
+
 def apply_halo_filter_per_channel(img: np.ndarray, halo_fn_wrapper: callable, resize_target: Optional[Tuple[int, int]] = None,) -> np.ndarray:
     if img is None: return None
     h, w = img.shape[:2]
@@ -135,73 +167,82 @@ def apply_halo_filter_per_channel(img: np.ndarray, halo_fn_wrapper: callable, re
 # ABSCHNITT 3: Gradio Wrapper für Low-Level C++-Funktionen (Definiert)
 # ---------------------------------------------------------------------------
 # Alle C-Kernel Wrapper müssen hier definiert werden, bevor sie in den .click-Handlern verwendet werden.
-def process_blur_box(img: np.ndarray, radius: int) -> np.ndarray:
+def process_blur_box(img: np.ndarray, radius: int, use_gpu: bool = False) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.box_blur_f32(src, dst_buf, src_w, src_h, ss, dst_stride, radius, use_mt=True)
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.box_blur(data, radius)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_blur_gaussian(img: np.ndarray, sigma: float) -> np.ndarray:
+def process_blur_gaussian(img: np.ndarray, sigma: float, use_gpu: bool = False) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.gaussian_blur_f32(src, dst_buf, src_w, src_h, ss, dst_stride, sigma, use_mt=True)
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.gaussian_blur_f32(data, sigma)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_filter_sobel(img: np.ndarray) -> np.ndarray:
+def process_filter_sobel(img: np.ndarray, use_gpu: bool = False) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.sobel_f32(src, dst_buf, src_w, src_h, ss, dst_stride, use_mt=True)
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.sobel_f32(data)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_filter_median(img: np.ndarray) -> np.ndarray:
+def process_filter_median(img: np.ndarray, use_gpu: bool = False) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.median3x3_f32(src, dst_buf, src_w, src_h, ss, dst_stride, use_mt=True)
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.median3x3_f32(data)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_filter_unsharp(img: np.ndarray, sigma: float, amount: float, threshold: float) -> np.ndarray:
+def process_filter_unsharp(img: np.ndarray, sigma: float, amount: float, threshold: float, use_gpu: bool = False) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.unsharp_mask_f32(
-            src, dst_buf, src_w, src_h, ss, dst_stride, 
+            src, dst_buf, src_w, src_h, ss, dst_stride,
             sigma=sigma, amount=amount, threshold=threshold, use_mt=True
         )
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.unsharp_mask_f32(data, sigma, amount, threshold)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_tonewheel_invert(img: np.ndarray, use_range: bool) -> np.ndarray:
+def process_tonewheel_invert(img: np.ndarray, use_range: bool, use_gpu: bool = False) -> np.ndarray:
     min_val = 0.0
     max_val = 1.0
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.invert_f32(
-            src, dst_buf, src_w, src_h, ss, dst_stride, 
+            src, dst_buf, src_w, src_h, ss, dst_stride,
             min_val=min_val, max_val=max_val, use_range=use_range, use_mt=True
         )
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.invert_f32(data, min_val=min_val, max_val=max_val)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_tonewheel_gamma(img: np.ndarray, gamma: float, gain: float) -> np.ndarray:
+def process_tonewheel_gamma(img: np.ndarray, gamma: float, gain: float, use_gpu: bool = False) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.gamma_f32(
-            src, dst_buf, src_w, src_h, ss, dst_stride, 
+            src, dst_buf, src_w, src_h, ss, dst_stride,
             gamma=gamma, gain=gain, use_mt=True
         )
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.gamma_f32(data, gamma=gamma, gain=gain)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_tonewheel_levels(img: np.ndarray, in_low: float, in_high: float, gamma: float) -> np.ndarray:
+def process_tonewheel_levels(img: np.ndarray, in_low: float, in_high: float, gamma: float, use_gpu: bool = False) -> np.ndarray:
     out_low = 0.0
     out_high = 1.0
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.levels_f32(
-            src, dst_buf, src_w, src_h, ss, dst_stride, 
-            in_low=in_low, in_high=in_high, 
-            out_low=out_low, out_high=out_high, 
+            src, dst_buf, src_w, src_h, ss, dst_stride,
+            in_low=in_low, in_high=in_high,
+            out_low=out_low, out_high=out_high,
             gamma=gamma, use_mt=True
         )
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.levels_f32(data, in_low, in_high, out_low, out_high, gamma)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
-def process_tonewheel_threshold(img: np.ndarray, low: float, high: float) -> np.ndarray:
+def process_tonewheel_threshold(img: np.ndarray, low: float, high: float, use_gpu: bool = False) -> np.ndarray:
     low_value = 0.0
     high_value = 1.0
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.threshold_f32(
-            src, dst_buf, src_w, src_h, ss, dst_stride, 
+            src, dst_buf, src_w, src_h, ss, dst_stride,
             low=low, high=high, low_value=low_value, high_value=high_value, use_mt=True
         )
-    return apply_halo_filter_per_channel(img, wrapper)
+    gpu_func = lambda data: gpu_instance.threshold_f32(data, low, high, low_value, high_value)
+    return _apply_backend_filter(img, wrapper, gpu_func, use_gpu)
 
 def process_morphology(img: np.ndarray, operation: str) -> np.ndarray:
     if operation == "Erode": halo_fn = halo_instance.erode3x3_f32
@@ -312,7 +353,7 @@ def process_hl_warp_affine(img: np.ndarray, tx: float, ty: float, rot: float, sc
 
 # Korrigierte Version von process_video_canny_pipeline
 
-def process_video_canny_pipeline(video_path: str, low_th: float, high_th: float, sigma: float) -> str:
+def process_video_canny_pipeline(video_path: str, low_th: float, high_th: float, sigma: float, use_gpu: bool = False) -> str:
     """Verarbeitet ein Video Frame für Frame mit dem HALO Canny Edge Detector."""
     if cv2 is None: raise RuntimeError("OpenCV (cv2) ist für die Videoverarbeitung erforderlich. Bitte installieren Sie es.")
     if video_path is None: return None
@@ -355,17 +396,31 @@ def process_video_canny_pipeline(video_path: str, low_th: float, high_th: float,
         frame_resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
         frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         
-        # 1. HALO Canny Edge Detection (auf dem kleineren Frame)
+        # 1. Kantenextraktion (GPU oder CPU)
         dtype_info = _get_dtype_info(frame_rgb)
         frame_f32 = _normalize_to_float32(frame_rgb, dtype_info)
-        
-        edges_f32 = canny_edge_detector(
-            frame_f32,
-            low_threshold=low_th,
-            high_threshold=high_th,
-            gaussian_sigma=sigma
-        )
-        
+
+        if use_gpu and _gpu_available():
+            try:
+                blurred = gpu_instance.gaussian_blur_f32(frame_f32, sigma)
+                grad = gpu_instance.sobel_f32(blurred)
+                edges_f32 = gpu_instance.threshold_f32(grad, low_th, high_th, 0.0, 1.0)
+            except Exception as exc:
+                print(f"GPU-Videopfad fehlgeschlagen, nutze CPU-Canny: {exc}")
+                edges_f32 = canny_edge_detector(
+                    frame_f32,
+                    low_threshold=low_th,
+                    high_threshold=high_th,
+                    gaussian_sigma=sigma
+                )
+        else:
+            edges_f32 = canny_edge_detector(
+                frame_f32,
+                low_threshold=low_th,
+                high_threshold=high_th,
+                gaussian_sigma=sigma
+            )
+
         # 2. Denormalisierung und Finalisierung
         edges_final = _denormalize_from_float32(edges_f32, dtype_info)
         
@@ -396,7 +451,7 @@ def process_video_canny_pipeline(video_path: str, low_th: float, high_th: float,
 with gr.Blocks(title="HALO Image Processor Demo") as demo:
     gr.Markdown(
         """
-        # HALO Image Processor Demo (CPU-Optimiert + High-Level Extensions)
+        # HALO Image Processor Demo (CPU- und GPU-Beschleunigt)
         """
     )
     
@@ -406,6 +461,11 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
     with gr.Row():
         image_input = gr.Image(label="Eingabebild (uint8/uint16/float)", type="numpy", interactive=True)
         image_output = gr.Image(label="Ergebnisbild", type="numpy")
+    with gr.Row():
+        use_gpu_checkbox = gr.Checkbox(
+            label="GPU-Beschleunigung verwenden (HALO GPU)",
+            value=_gpu_available(),
+        )
 
     with gr.Tabs() as tabs:
         
@@ -532,11 +592,15 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
     # ----------------------------------------------------------------
 
     # C++ Filter
-    btn_box.click(process_blur_box, inputs=[image_input, radius_box], outputs=image_output)
-    btn_gauss.click(process_blur_gaussian, inputs=[image_input, sigma_gauss], outputs=image_output)
-    btn_sobel.click(process_filter_sobel, inputs=[image_input], outputs=image_output)
-    btn_median.click(process_filter_median, inputs=[image_input], outputs=image_output)
-    btn_unsharp.click(process_filter_unsharp, inputs=[image_input, sigma_unsharp, amount_unsharp, threshold_unsharp], outputs=image_output)
+    btn_box.click(process_blur_box, inputs=[image_input, radius_box, use_gpu_checkbox], outputs=image_output)
+    btn_gauss.click(process_blur_gaussian, inputs=[image_input, sigma_gauss, use_gpu_checkbox], outputs=image_output)
+    btn_sobel.click(process_filter_sobel, inputs=[image_input, use_gpu_checkbox], outputs=image_output)
+    btn_median.click(process_filter_median, inputs=[image_input, use_gpu_checkbox], outputs=image_output)
+    btn_unsharp.click(
+        process_filter_unsharp,
+        inputs=[image_input, sigma_unsharp, amount_unsharp, threshold_unsharp, use_gpu_checkbox],
+        outputs=image_output,
+    )
 
     # High-Level Filter
     btn_bilat.click(process_hl_bilateral, inputs=[image_input, bilat_diam, bilat_sigma_c, bilat_sigma_s], outputs=image_output)
@@ -549,16 +613,32 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
 
     # Video-Verarbeitung (NEU)
     btn_process_video.click(
-        process_video_canny_pipeline, 
-        inputs=[video_input, video_canny_low, video_canny_high, video_canny_sigma],
+        process_video_canny_pipeline,
+        inputs=[video_input, video_canny_low, video_canny_high, video_canny_sigma, use_gpu_checkbox],
         outputs=video_output
     )
 
     # C++ Tonwert
-    btn_invert.click(process_tonewheel_invert, inputs=[image_input, gr.State(True)], outputs=image_output)
-    btn_gamma.click(process_tonewheel_gamma, inputs=[image_input, gamma_gamma, gamma_gain], outputs=image_output)
-    btn_levels.click(process_tonewheel_levels, inputs=[image_input, levels_low, levels_high, levels_gamma], outputs=image_output)
-    btn_threshold.click(process_tonewheel_threshold, inputs=[image_input, threshold_low, threshold_high], outputs=image_output)
+    btn_invert.click(
+        process_tonewheel_invert,
+        inputs=[image_input, gr.State(True), use_gpu_checkbox],
+        outputs=image_output,
+    )
+    btn_gamma.click(
+        process_tonewheel_gamma,
+        inputs=[image_input, gamma_gamma, gamma_gain, use_gpu_checkbox],
+        outputs=image_output,
+    )
+    btn_levels.click(
+        process_tonewheel_levels,
+        inputs=[image_input, levels_low, levels_high, levels_gamma, use_gpu_checkbox],
+        outputs=image_output,
+    )
+    btn_threshold.click(
+        process_tonewheel_threshold,
+        inputs=[image_input, threshold_low, threshold_high, use_gpu_checkbox],
+        outputs=image_output,
+    )
 
     # C++ Morphologie
     btn_erode.click(process_morphology, inputs=[image_input, gr.State("Erode")], outputs=image_output)

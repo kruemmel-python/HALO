@@ -8,7 +8,10 @@
 
 ## 1. HALO-Architektur und Kern-Optimierungen
 
-Das Herzstück von HALO ist ein C++-Kern (`fastpath.cpp`), der für maximale Hardware-Auslastung auf modernen x86-Prozessoren optimiert ist.
+Das Herzstück von HALO ist der kombinierte C++-Treiber (`halo_driver.cpp`).
+Er vereint den klassischen SIMD/Threading "Fast Path" sowie den OpenCL-GPU-
+Pfad in einer einzigen Übersetzungseinheit und ermöglicht so CPU- und GPU-
+Beschleunigung mit nur einer nativen Bibliothek.
 
 ### 1.1. Core-Features und C++-Optimierung
 
@@ -39,21 +42,21 @@ Das Modul `halo_extensions.py` nutzt NumPy (optional CuPy) für komplexere Opera
 | :--- | :--- | :--- |
 | **`halo_extensions.py`** | **Bilateral Filter**, **Canny Edge Detector**. Erweiterte Morphologie (Gradient, Top-Hat). | Unterstützt **uint8, uint16, float32, float64** (automatische Normalisierung). |
 | **`halo_extensions.py`** | **Farbraum-Konvertierungen** (RGB, HSV, YCbCr, Gray). Affine/Perspektiv-**Warping** (`AffineTransform`). | |
-| **`halo_gpu.py`** | Experimentelle GPU-Bridge (SAXPY, Sum, Convolve). | Nutzt **CuPy (CUDA)** als Backend, fällt auf NumPy zurück. |
+| **`halo_gpu.py`** | GPU-Bridge (SAXPY, Filter, Tonwertkorrektur, Warp). | Nutzt **CuPy (CUDA)** als Backend, fällt auf NumPy zurück. |
 
 ---
 
 ## 3. Kompilierungsanweisungen (C++ Driver)
 
-Die kompilierte Shared Library (`halo_fastpath.dll` oder `libhalo_fastpath.so`) muss sich **im selben Ordner wie `halo.py`** befinden.
+Die kompilierte Shared Library (`halo_driver.dll`/`halo_fastpath.dll` oder `libhalo_driver.so`) muss sich **im selben Ordner wie `halo.py`** befinden.
 
 ### 3.1. Unter MinGW/GCC (Windows / Linux)
 
 Verwenden Sie das Kommando, das die Thread- und Architektur-Flags korrekt anordnet, um Linker-Fehler zu vermeiden:
 
 ```bash
-# Empfohlenes Kommando
-g++ -O3 -march=native -pthread -shared -o halo_fastpath.dll fastpath.cpp
+# Empfohlenes Kommando (CPU + GPU in einem Treiber)
+g++ -O3 -march=native -pthread -shared -o halo_fastpath.dll halo_driver.cpp
 ```
 *(Verwenden Sie `-o libhalo_fastpath.so` für Linux/macOS.)*
 
@@ -62,7 +65,7 @@ g++ -O3 -march=native -pthread -shared -o halo_fastpath.dll fastpath.cpp
 Führen Sie den Befehl im *x64 Native Tools Command Prompt* aus:
 
 ```cmd
-cl /LD /EHsc /O2 /arch:AVX2 /std:c++17 fastpath.cpp /Fe:halo_fastpath.dll
+cl /LD /EHsc /O2 /arch:AVX2 /std:c++17 halo_driver.cpp /Fe:halo_fastpath.dll
 ```
 
 ---
@@ -116,3 +119,5 @@ Führen Sie das Gradio-Demo-Skript aus, um alle C++-optimierten und High-Level-F
 ```bash
 python halo_demo_app.py
 ```
+
+Aktivieren Sie in der Oberfläche die Option **„GPU-Beschleunigung verwenden (HALO GPU)“**, um die OpenCL/CuPy-Pfade zu nutzen.

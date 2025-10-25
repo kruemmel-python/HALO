@@ -29,11 +29,25 @@ __all__ = [
 def _load_lib() -> C.CDLL:
     here = Path(__file__).resolve().parent
     if os.name == "nt":
-        cand = here / "halo_fastpath.dll"
-        return C.CDLL(str(cand)) if cand.exists() else C.CDLL("halo_fastpath.dll")
+        candidates = ["halo_driver.dll", "halo_fastpath.dll"]
     else:
-        cand = here / "libhalo_fastpath.so"
-        return C.CDLL(str(cand)) if cand.exists() else C.CDLL("libhalo_fastpath.so")
+        candidates = [
+            "libhalo_driver.so",
+            "halo_driver.so",
+            "libhalo_fastpath.so",
+            "halo_fastpath.so",
+        ]
+
+    last_error: Optional[Exception] = None
+    for name in candidates:
+        local = here / name
+        try:
+            if local.exists():
+                return C.CDLL(str(local))
+            return C.CDLL(name)
+        except Exception as exc:  # pragma: no cover - dependent on local setup
+            last_error = exc
+    raise OSError(f"Unable to load HALO native library. Tried: {candidates}") from last_error
 
 _lib = _load_lib()
 
