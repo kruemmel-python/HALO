@@ -29,8 +29,12 @@ try:
     def _to_c_f32_ptr_2d(buf: HALO_Buffer, *args, **kwargs) -> HALO_Buffer:
         return buf
 
-    halo_instance = HALO(threads=4)
+    halo_instance = HALO(threads=4, use_gpu=True)
     print(f"HALO-Bibliothek ({halo_instance.features}) erfolgreich geladen.")
+    if getattr(halo_instance, "gpu_enabled", False):
+        print(f"GPU-Beschleunigung aktiviert (Gerät {halo_instance.gpu_device}).")
+    else:
+        print("GPU-Beschleunigung nicht verfügbar – CPU-Pfade aktiv.")
     
 except ImportError as e:
     print(f"FEHLER: HALO-Import fehlgeschlagen. Einige Funktionen sind deaktiviert. {e}")

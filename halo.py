@@ -29,11 +29,19 @@ __all__ = [
 def _load_lib() -> C.CDLL:
     here = Path(__file__).resolve().parent
     if os.name == "nt":
-        cand = here / "halo_fastpath.dll"
-        return C.CDLL(str(cand)) if cand.exists() else C.CDLL("halo_fastpath.dll")
+        candidates = ["halo_driver.dll", "halo_fastpath.dll"]
     else:
-        cand = here / "libhalo_fastpath.so"
-        return C.CDLL(str(cand)) if cand.exists() else C.CDLL("libhalo_fastpath.so")
+        candidates = ["libhalo_driver.so", "halo_driver.so", "libhalo_fastpath.so"]
+
+    for name in candidates:
+        cand = here / name
+        try:
+            if cand.exists():
+                return C.CDLL(str(cand))
+            return C.CDLL(name)
+        except OSError:
+            continue
+    raise OSError("Keine HALO Bibliothek gefunden (halo_driver/halo_fastpath).")
 
 _lib = _load_lib()
 
@@ -284,6 +292,101 @@ try:
     _HAS_SHUTDOWN = True
 except AttributeError:
     _HAS_SHUTDOWN = False
+
+try:
+    _lib.halo_gpu_prepare.argtypes = [C.c_int]
+    _lib.halo_gpu_prepare.restype = C.c_int
+    _lib.halo_gpu_release.argtypes = [C.c_int]
+    _lib.halo_gpu_release.restype = None
+
+    _lib.halo_gpu_box_blur_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_int,
+        C.c_int,
+    ]
+    _lib.halo_gpu_box_blur_f32.restype = C.c_int
+
+    _lib.halo_gpu_gaussian_blur_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_float,
+        C.c_int,
+    ]
+    _lib.halo_gpu_gaussian_blur_f32.restype = C.c_int
+
+    _lib.halo_gpu_sobel_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_int,
+    ]
+    _lib.halo_gpu_sobel_f32.restype = C.c_int
+
+    _lib.halo_gpu_median3x3_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_int,
+    ]
+    _lib.halo_gpu_median3x3_f32.restype = C.c_int
+
+    _lib.halo_gpu_invert_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_float, C.c_float,
+        C.c_int,
+        C.c_int,
+    ]
+    _lib.halo_gpu_invert_f32.restype = C.c_int
+
+    _lib.halo_gpu_gamma_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_float, C.c_float,
+        C.c_int,
+    ]
+    _lib.halo_gpu_gamma_f32.restype = C.c_int
+
+    _lib.halo_gpu_levels_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_float, C.c_float,
+        C.c_float, C.c_float,
+        C.c_float,
+        C.c_int,
+    ]
+    _lib.halo_gpu_levels_f32.restype = C.c_int
+
+    _lib.halo_gpu_threshold_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_float, C.c_float,
+        C.c_float, C.c_float,
+        C.c_int,
+    ]
+    _lib.halo_gpu_threshold_f32.restype = C.c_int
+
+    _lib.halo_gpu_unsharp_mask_f32.argtypes = [
+        C.POINTER(C.c_float), C.c_longlong,
+        C.POINTER(C.c_float), C.c_longlong,
+        C.c_int, C.c_int,
+        C.c_float, C.c_float, C.c_float,
+        C.c_int,
+    ]
+    _lib.halo_gpu_unsharp_mask_f32.restype = C.c_int
+
+    _HAS_GPU_FUNCS = True
+except AttributeError:
+    _HAS_GPU_FUNCS = False
+
+_GPU_ACTIVE_DEVICE = -1
 
 # ---------------- Profil-Persistenz ----------------
 PROFILE_PATH = Path.home() / ".halo_profile.json"
@@ -1060,10 +1163,16 @@ class HALO:
         enable_streaming: bool = True,
         stream_threshold: int = 1_000_000,
         threads: int = 1,
+        *,
+        use_gpu: bool = False,
+        gpu_device_index: int = 0,
     ):
         if _lib.halo_init_features() != 0:
             raise RuntimeError("halo_init_features() fehlgeschlagen.")
         self.features = self._query_features()
+
+        self._gpu_enabled = False
+        self._gpu_device = -1
 
         self.configure(enable_streaming=enable_streaming,
                        stream_threshold=stream_threshold,
@@ -1093,6 +1202,12 @@ class HALO:
                                    C.c_int(self.profile["sum_impl"])) != 0:
                 raise RuntimeError("halo_set_impls() fehlgeschlagen.")
 
+        if use_gpu and _HAS_GPU_FUNCS:
+            if not self.enable_gpu(gpu_device_index):
+                print("HALO: GPU-Initialisierung fehlgeschlagen, verwende CPU-Pfade.")
+        elif use_gpu:
+            print("HALO: GPU-Funktionen im nativen Treiber nicht verfügbar, verwende CPU.")
+
     def configure(self, enable_streaming: bool, stream_threshold: int, threads: int) -> None:
         if _lib.halo_configure(C.c_int(1 if enable_streaming else 0),
                                C.c_longlong(stream_threshold),
@@ -1107,6 +1222,37 @@ class HALO:
         cfg.update({"threads": int(threads)})
         self.profile["cfg"] = cfg
         _write_profile(self.profile)
+
+    @property
+    def gpu_enabled(self) -> bool:
+        return bool(self._gpu_enabled)
+
+    @property
+    def gpu_device(self) -> int:
+        return int(self._gpu_device)
+
+    def enable_gpu(self, device_index: int = 0) -> bool:
+        if not _HAS_GPU_FUNCS:
+            return False
+        rc = _lib.halo_gpu_prepare(C.c_int(device_index))
+        if rc != 0:
+            return False
+        self._gpu_enabled = True
+        self._gpu_device = int(device_index)
+        global _GPU_ACTIVE_DEVICE
+        _GPU_ACTIVE_DEVICE = int(device_index)
+        return True
+
+    def disable_gpu(self) -> None:
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            try:
+                _lib.halo_gpu_release(C.c_int(self._gpu_device))
+            except Exception:
+                pass
+            self._gpu_enabled = False
+            self._gpu_device = -1
+            global _GPU_ACTIVE_DEVICE
+            _GPU_ACTIVE_DEVICE = -1
 
     def saxpy(self, a: float, x: ArrayLikeFloat, y: ArrayLikeFloat) -> None:
         xptr, n1 = _to_c_float_ptr(x)
@@ -1386,14 +1532,24 @@ class HALO:
             raise ValueError("max_val muss größer als min_val sein.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_invert_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_float(min_val), C.c_float(max_val),
-            C.c_int(1 if use_range else 0),
-            C.c_int(1 if use_mt else 0),
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_invert_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(min_val), C.c_float(max_val),
+                C.c_int(1 if use_range else 0),
+                C.c_int(1 if use_mt else 0),
+            )
+        else:
+            rc = _lib.halo_invert_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(min_val), C.c_float(max_val),
+                C.c_int(1 if use_range else 0),
+                C.c_int(1 if use_mt else 0),
+            )
         if rc != 0:
             raise RuntimeError(f"halo_invert_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1418,13 +1574,22 @@ class HALO:
             raise ValueError("Stride zu klein für float32-Bild.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_gamma_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_float(gamma), C.c_float(gain),
-            C.c_int(1 if use_mt else 0),
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_gamma_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(gamma), C.c_float(gain),
+                C.c_int(1 if use_mt else 0),
+            )
+        else:
+            rc = _lib.halo_gamma_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(gamma), C.c_float(gain),
+                C.c_int(1 if use_mt else 0),
+            )
         if rc != 0:
             raise RuntimeError(f"halo_gamma_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1454,15 +1619,26 @@ class HALO:
             raise ValueError("gamma muss > 0 sein.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_levels_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_float(in_low), C.c_float(in_high),
-            C.c_float(out_low), C.c_float(out_high),
-            C.c_float(gamma),
-            C.c_int(1 if use_mt else 0),
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_levels_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(in_low), C.c_float(in_high),
+                C.c_float(out_low), C.c_float(out_high),
+                C.c_float(gamma),
+                C.c_int(1 if use_mt else 0),
+            )
+        else:
+            rc = _lib.halo_levels_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(in_low), C.c_float(in_high),
+                C.c_float(out_low), C.c_float(out_high),
+                C.c_float(gamma),
+                C.c_int(1 if use_mt else 0),
+            )
         if rc != 0:
             raise RuntimeError(f"halo_levels_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1487,14 +1663,24 @@ class HALO:
             raise ValueError("Stride zu klein für float32-Bild.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_threshold_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_float(low), C.c_float(high),
-            C.c_float(low_value), C.c_float(high_value),
-            C.c_int(1 if use_mt else 0),
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_threshold_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(low), C.c_float(high),
+                C.c_float(low_value), C.c_float(high_value),
+                C.c_int(1 if use_mt else 0),
+            )
+        else:
+            rc = _lib.halo_threshold_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(low), C.c_float(high),
+                C.c_float(low_value), C.c_float(high_value),
+                C.c_int(1 if use_mt else 0),
+            )
         if rc != 0:
             raise RuntimeError(f"halo_threshold_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1515,12 +1701,20 @@ class HALO:
             raise ValueError("Stride zu klein für float32-Bild.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_median3x3_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_int(1 if use_mt else 0),
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_median3x3_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_int(1 if use_mt else 0),
+            )
+        else:
+            rc = _lib.halo_median3x3_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_int(1 if use_mt else 0),
+            )
         if rc != 0:
             raise RuntimeError(f"halo_median3x3_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1650,15 +1844,26 @@ class HALO:
             raise ValueError("Stride zu klein für float32-Bild.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_unsharp_mask_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_float(sigma),
-            C.c_float(amount),
-            C.c_float(threshold),
-            C.c_int(1 if use_mt else 0),
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_unsharp_mask_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(sigma),
+                C.c_float(amount),
+                C.c_float(threshold),
+                C.c_int(1 if use_mt else 0),
+            )
+        else:
+            rc = _lib.halo_unsharp_mask_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(sigma),
+                C.c_float(amount),
+                C.c_float(threshold),
+                C.c_int(1 if use_mt else 0),
+            )
         if rc != 0:
             raise RuntimeError(f"halo_unsharp_mask_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1722,13 +1927,22 @@ class HALO:
             raise ValueError("width/height müssen > 0 sein.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_box_blur_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_int(radius),
-            C.c_int(1 if use_mt else 0)
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_box_blur_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_int(radius),
+                C.c_int(1 if use_mt else 0)
+            )
+        else:
+            rc = _lib.halo_box_blur_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_int(radius),
+                C.c_int(1 if use_mt else 0)
+            )
         if rc != 0:
             raise RuntimeError(f"halo_box_blur_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1748,13 +1962,22 @@ class HALO:
             raise ValueError("width/height müssen > 0 sein.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_gaussian_blur_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_float(sigma),
-            C.c_int(1 if use_mt else 0)
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_gaussian_blur_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(sigma),
+                C.c_int(1 if use_mt else 0)
+            )
+        else:
+            rc = _lib.halo_gaussian_blur_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_float(sigma),
+                C.c_int(1 if use_mt else 0)
+            )
         if rc != 0:
             raise RuntimeError(f"halo_gaussian_blur_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1773,12 +1996,20 @@ class HALO:
             raise ValueError("width/height müssen > 0 sein.")
         c_src = _to_c_f32_ptr_2d(src, width, height, src_stride_bytes)
         c_dst = _to_c_f32_ptr_2d(dst, width, height, dst_stride_bytes)
-        rc = _lib.halo_sobel_f32(
-            c_src, C.c_longlong(src_stride_bytes),
-            c_dst, C.c_longlong(dst_stride_bytes),
-            C.c_int(width), C.c_int(height),
-            C.c_int(1 if use_mt else 0)
-        )
+        if self._gpu_enabled and _HAS_GPU_FUNCS:
+            rc = _lib.halo_gpu_sobel_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_int(1 if use_mt else 0)
+            )
+        else:
+            rc = _lib.halo_sobel_f32(
+                c_src, C.c_longlong(src_stride_bytes),
+                c_dst, C.c_longlong(dst_stride_bytes),
+                C.c_int(width), C.c_int(height),
+                C.c_int(1 if use_mt else 0)
+            )
         if rc != 0:
             raise RuntimeError(f"halo_sobel_f32() fehlgeschlagen (rc={rc}).")
 
@@ -1868,6 +2099,7 @@ class HALO:
 
     # Optional: manueller Shutdown (z. B. bei langlaufenden Prozessen)
     def close(self) -> None:
+        self.disable_gpu()
         if _HAS_SHUTDOWN:
             try:
                 _lib.halo_shutdown_pool()
@@ -1889,4 +2121,14 @@ def _shutdown_pool_if_available():
         except Exception:
             pass
 
+def _shutdown_gpu_if_available():
+    global _GPU_ACTIVE_DEVICE
+    if _HAS_GPU_FUNCS and _GPU_ACTIVE_DEVICE >= 0:
+        try:
+            _lib.halo_gpu_release(C.c_int(_GPU_ACTIVE_DEVICE))
+        except Exception:
+            pass
+        _GPU_ACTIVE_DEVICE = -1
+
 atexit.register(_shutdown_pool_if_available)
+atexit.register(_shutdown_gpu_if_available)

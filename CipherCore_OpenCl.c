@@ -42,6 +42,10 @@
     #include <CL/cl.h>
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // --- Platform Specific Defines ---
 #ifndef M_PI
 /** @brief Definition of PI if not already defined. */
@@ -72,7 +76,9 @@ int munmap(void* addr, size_t length) { return -1; }
 /** @brief Placeholder function to read PCI config space (returns 0). */
 unsigned int read_pci_config(int gpu_index, int offset) { return 0; }
 /** @brief Macro for exporting functions from a DLL on Windows. */
+#ifndef DLLEXPORT
 #define DLLEXPORT __declspec(dllexport)
+#endif
 #else
 // Linux specific includes and definitions
 #include <fcntl.h>
@@ -81,7 +87,9 @@ unsigned int read_pci_config(int gpu_index, int offset) { return 0; }
 /** @brief Placeholder function to read PCI config space (returns 0). */
 unsigned int read_pci_config(int gpu_index, int offset) { return 0; }
 /** @brief Macro for exporting functions with default visibility on Linux/GCC. */
+#ifndef DLLEXPORT
 #define DLLEXPORT __attribute__((visibility("default")))
+#endif
 #endif
 
 // --- Global Data Type ---
@@ -4125,3 +4133,6 @@ DLLEXPORT unsigned int simulated_get_compute_unit_count(int gpu_index) {
 }
 
 // --- End of File ---
+#ifdef __cplusplus
+}
+#endif
