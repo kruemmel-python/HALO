@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple, Union, Optional, Any
 from array import array
 
-
 __all__ = [
     "HALO",
     "Impl",
@@ -293,97 +292,118 @@ try:
 except AttributeError:
     _HAS_SHUTDOWN = False
 
+# --- GPU-Funktions-Bindings: tolerant auf Symbolnamen ---
+def _bind_first(name_list: list[str]) -> Optional[Any]:
+    for nm in name_list:
+        fn = getattr(_lib, nm, None)
+        if fn is not None:
+            return fn
+    return None
+
+_HAS_GPU_FUNCS = False
 try:
-    _lib.halo_gpu_prepare.argtypes = [C.c_int]
-    _lib.halo_gpu_prepare.restype = C.c_int
-    _lib.halo_gpu_release.argtypes = [C.c_int]
-    _lib.halo_gpu_release.restype = None
+    # Primär die "neuen" Namen, Fallback auf ältere DLL-Exports
+    _gpu_prepare = _bind_first(["halo_gpu_prepare", "initialize_gpu"])
+    _gpu_release = _bind_first(["halo_gpu_release", "shutdown_gpu"])
 
-    _lib.halo_gpu_box_blur_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_int,
-        C.c_int,
-    ]
-    _lib.halo_gpu_box_blur_f32.restype = C.c_int
+    if _gpu_prepare is not None and _gpu_release is not None:
+        _gpu_prepare.argtypes = [C.c_int]
+        _gpu_prepare.restype = C.c_int
 
-    _lib.halo_gpu_gaussian_blur_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_float,
-        C.c_int,
-    ]
-    _lib.halo_gpu_gaussian_blur_f32.restype = C.c_int
+        _gpu_release.argtypes = [C.c_int]
+        try:
+            _gpu_release.restype = None
+        except Exception:
+            pass
 
-    _lib.halo_gpu_sobel_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_int,
-    ]
-    _lib.halo_gpu_sobel_f32.restype = C.c_int
+        # Den gefundenen Implementierungen Standard-Namen geben
+        _lib.halo_gpu_prepare = _gpu_prepare
+        _lib.halo_gpu_release = _gpu_release
+        _HAS_GPU_FUNCS = True
 
-    _lib.halo_gpu_median3x3_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_int,
-    ]
-    _lib.halo_gpu_median3x3_f32.restype = C.c_int
+        # Optionale GPU-Kernel nur binden, wenn vorhanden (Fehlen ist okay)
+        def _bind_opt(name: str, argtypes: list[Any], restype: Any = C.c_int) -> None:
+            fn = getattr(_lib, name, None)
+            if fn is not None:
+                fn.argtypes = argtypes
+                fn.restype = restype
 
-    _lib.halo_gpu_invert_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_float, C.c_float,
-        C.c_int,
-        C.c_int,
-    ]
-    _lib.halo_gpu_invert_f32.restype = C.c_int
+        _bind_opt("halo_gpu_box_blur_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_int,
+            C.c_int,
+        ])
 
-    _lib.halo_gpu_gamma_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_float, C.c_float,
-        C.c_int,
-    ]
-    _lib.halo_gpu_gamma_f32.restype = C.c_int
+        _bind_opt("halo_gpu_gaussian_blur_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_float,
+            C.c_int,
+        ])
 
-    _lib.halo_gpu_levels_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_float, C.c_float,
-        C.c_float, C.c_float,
-        C.c_float,
-        C.c_int,
-    ]
-    _lib.halo_gpu_levels_f32.restype = C.c_int
+        _bind_opt("halo_gpu_sobel_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_int,
+        ])
 
-    _lib.halo_gpu_threshold_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_float, C.c_float,
-        C.c_float, C.c_float,
-        C.c_int,
-    ]
-    _lib.halo_gpu_threshold_f32.restype = C.c_int
+        _bind_opt("halo_gpu_median3x3_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_int,
+        ])
 
-    _lib.halo_gpu_unsharp_mask_f32.argtypes = [
-        C.POINTER(C.c_float), C.c_longlong,
-        C.POINTER(C.c_float), C.c_longlong,
-        C.c_int, C.c_int,
-        C.c_float, C.c_float, C.c_float,
-        C.c_int,
-    ]
-    _lib.halo_gpu_unsharp_mask_f32.restype = C.c_int
+        _bind_opt("halo_gpu_invert_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_float, C.c_float,
+            C.c_int,
+            C.c_int,
+        ])
 
-    _HAS_GPU_FUNCS = True
-except AttributeError:
+        _bind_opt("halo_gpu_gamma_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_float, C.c_float,
+            C.c_int,
+        ])
+
+        _bind_opt("halo_gpu_levels_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_float, C.c_float,
+            C.c_float, C.c_float,
+            C.c_float,
+            C.c_int,
+        ])
+
+        _bind_opt("halo_gpu_threshold_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_float, C.c_float,
+            C.c_float, C.c_float,
+            C.c_int,
+        ])
+
+        _bind_opt("halo_gpu_unsharp_mask_f32", [
+            C.POINTER(C.c_float), C.c_longlong,
+            C.POINTER(C.c_float), C.c_longlong,
+            C.c_int, C.c_int,
+            C.c_float, C.c_float, C.c_float,
+            C.c_int,
+        ])
+    else:
+        _HAS_GPU_FUNCS = False
+except Exception:
     _HAS_GPU_FUNCS = False
 
 _GPU_ACTIVE_DEVICE = -1
@@ -407,18 +427,16 @@ ArrayLikeFloat = Union[array, memoryview]
 ArrayLikeU8    = Union[bytes, bytearray, memoryview]
 ArrayLikeU16   = Union[array, memoryview, bytes, bytearray]
 
-
 # ------------------------------------------------------------
 #  Vektorgrafik: Parser, Rasterizer, Plot-Layout
 # ------------------------------------------------------------
-
 
 def _ensure_mutable_f32_view(buf: ArrayLikeFloat) -> memoryview:
     if isinstance(buf, array) and buf.typecode == 'f':
         return memoryview(buf)
     if isinstance(buf, memoryview) and buf.format == 'f' and buf.contiguous and not buf.readonly:
         return buf
-    raise TypeError("Erwarte array('f') oder beschreibbaren memoryview('f').")
+    raise TypeError("Erwarte array('f') or beschreibbaren memoryview('f').")
 
 def _distance_point_segment(px: float, py: float, x0: float, y0: float, x1: float, y1: float) -> float:
     dx = x1 - x0
@@ -434,7 +452,6 @@ def _distance_point_segment(px: float, py: float, x0: float, y0: float, x1: floa
     cy = y0 + t * dy
     return math.hypot(px - cx, py - cy)
 
-
 def _point_in_polygon(x: float, y: float, pts: Sequence[Tuple[float, float]]) -> bool:
     inside = False
     n = len(pts)
@@ -448,7 +465,6 @@ def _point_in_polygon(x: float, y: float, pts: Sequence[Tuple[float, float]]) ->
             inside = not inside
         j = i
     return inside
-
 
 def _flatten_quadratic(p0, p1, p2, tolerance: float) -> List[Tuple[float, float]]:
     def _approx(a, b, c, out):
@@ -471,7 +487,6 @@ def _flatten_quadratic(p0, p1, p2, tolerance: float) -> List[Tuple[float, float]
     result = [p0]
     _approx(p0, p1, p2, result)
     return result
-
 
 def _flatten_cubic(p0, p1, p2, p3, tolerance: float) -> List[Tuple[float, float]]:
     def _approx(a, b, c, d, out):
@@ -497,12 +512,10 @@ def _flatten_cubic(p0, p1, p2, p3, tolerance: float) -> List[Tuple[float, float]
     _approx(p0, p1, p2, p3, result)
     return result
 
-
 @dataclass
 class PathCommand:
     command: str
     points: List[Tuple[float, float]]
-
 
 class SVGPath:
     """Einfacher Parser für SVG-Pfad-Daten (Untermenge: M, L, H, V, C, Q, Z)."""
@@ -665,7 +678,6 @@ class SVGPath:
             closed.append(False)
         return contours, closed
 
-
 @dataclass
 class VectorShape:
     contours: List[List[Tuple[float, float]]]
@@ -683,7 +695,6 @@ class VectorShape:
         contours, closed = path.to_polylines(tolerance)
         return cls(contours, closed, fill_color=fill_color,
                    stroke_color=stroke_color, stroke_width=stroke_width)
-
 
 DEFAULT_FONT: dict[str, Tuple[int, int, List[str]]] = {
     "0": (5, 7, [
@@ -807,7 +818,6 @@ DEFAULT_FONT[" "] = (3, 7, ["   "] * 7)
 DEFAULT_FONT["-"] = (3, 7, ["   ", "   ", "   ", "###", "   ", "   ", "   "])
 DEFAULT_FONT["."] = (1, 7, [" ", " ", " ", " ", " ", "##", "##"])
 DEFAULT_FONT[","] = (2, 7, ["  ", "  ", "  ", "  ", "##", "##", " #"])
-
 
 class VectorCanvas:
     """Einfache Float-Canvas mit antialiasenden Zeichenfunktionen."""
@@ -935,7 +945,6 @@ class VectorCanvas:
             dst_offset = pitch * y
             mv[dst_offset:dst_offset + self.width] = self.buffer[start:end]
 
-
 class PlotLayout:
     """Hilfsklasse für einfache Diagramm-Layouts auf einem VectorCanvas."""
 
@@ -985,7 +994,7 @@ class PlotLayout:
 
         x0, y0, x1, y1 = self._axis_bounds()
 
-        # Min/Max robust (NumPy oder Python-Listen)
+        # Min/Max robust (NumPy or Python-Listen)
         min_x = float(min(xs_list)); max_x = float(max(xs_list))
         min_y = float(min(ys_list)); max_y = float(max(ys_list))
 
@@ -1001,8 +1010,6 @@ class PlotLayout:
         self.canvas.stroke_polyline(points, color, width=1.5)
         self.draw_axes(x_label=x_label, y_label=y_label, title=title, tick_count=tick_count)
 
-
-
 def _to_c_float_ptr(buf: ArrayLikeFloat) -> Tuple[C.POINTER(C.c_float), int]:
     match buf:
         case arr if isinstance(arr, array) and arr.typecode == 'f':
@@ -1014,7 +1021,7 @@ def _to_c_float_ptr(buf: ArrayLikeFloat) -> Tuple[C.POINTER(C.c_float), int]:
             c_arr = (C.c_float * (mv.nbytes // 4)).from_buffer(mv)
             return C.cast(c_arr, C.POINTER(C.c_float)), n
         case _:
-            raise TypeError("Erwarte array('f') oder schreibbaren, kontiguösen memoryview('f').")
+            raise TypeError("Erwarte array('f') or schreibbaren, kontiguösen memoryview('f').")
 
 def _to_c_u8_ptr_2d(buf: ArrayLikeU8, width: int, height: int, stride_bytes: int) -> C.POINTER(C.c_ubyte):
     if isinstance(buf, (bytes, bytearray)):
@@ -1022,7 +1029,7 @@ def _to_c_u8_ptr_2d(buf: ArrayLikeU8, width: int, height: int, stride_bytes: int
     elif isinstance(buf, memoryview):
         mv = buf
     else:
-        raise TypeError("src erwartet bytes, bytearray oder memoryview.")
+        raise TypeError("src erwartet bytes, bytearray or memoryview.")
     if mv.itemsize != 1 or not mv.contiguous:
         raise TypeError("src muss kontiguös und 1-Byte-Elemente haben.")
     min_bytes = (height - 1) * stride_bytes + width
@@ -1041,7 +1048,7 @@ def _to_c_f32_ptr_2d(buf: ArrayLikeFloat, width: int, height: int, stride_bytes:
         case mv if isinstance(mv, memoryview) and mv.format == 'f' and mv.contiguous and not mv.readonly:
             pass
         case _:
-            raise TypeError("dst erwartet array('f') oder schreibbaren, kontiguösen memoryview('f').")
+            raise TypeError("dst erwartet array('f') or schreibbaren, kontiguösen memoryview('f').")
     if components <= 0:
         raise ValueError("components muss >= 1 sein.")
     min_bytes = (height - 1) * stride_bytes + width * components * 4
@@ -1060,7 +1067,7 @@ def _to_c_u16_ptr_2d(buf: ArrayLikeU16, width: int, height: int, stride_bytes: i
         if mv.format != 'H':
             mv = mv.cast('H')
     else:
-        raise TypeError("src erwartet array('H'), memoryview('H') oder bytes/bytearray.")
+        raise TypeError("src erwartet array('H'), memoryview('H') or bytes/bytearray.")
     if mv.itemsize != 2:
         mv = mv.cast('H')
     if not mv.contiguous:
@@ -1086,7 +1093,7 @@ def _to_c_lut_ptr(lut: Union[Sequence[float], array, memoryview]) -> C.POINTER(C
         arrf = array('f', lut)
         c_arr = (C.c_float * 256).from_buffer(arrf)
         return C.cast(c_arr, C.POINTER(C.c_float))
-    raise ValueError("LUT muss genau 256 float-Werte enthalten (array('f'), memoryview('f') oder Sequenz).")
+    raise ValueError("LUT muss genau 256 float-Werte enthalten (array('f'), memoryview('f') or Sequenz).")
 
 def make_identity_lut() -> array:
     return array('f', [float(i) for i in range(256)])
@@ -2113,7 +2120,7 @@ class HALO:
             raise RuntimeError("halo_query_features() fehlgeschlagen.")
         return {"sse2": bool(sse2.value), "avx2": bool(avx2.value), "avx512": bool(avx512.value)}
 
-# Automatischer Pool-Shutdown beim Interpreter-Exit
+# Automatischer Pool/GPU Shutdown beim Interpreter-Exit
 def _shutdown_pool_if_available():
     if _HAS_SHUTDOWN:
         try:

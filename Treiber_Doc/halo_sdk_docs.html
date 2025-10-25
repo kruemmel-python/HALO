@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HALO Fast‑Path & OpenCL Hybrid Engine – SDK Dokumentation</title>
+  <meta name="color-scheme" content="light dark">
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #0f172a; /* slate-900 */
+      --muted: #475569; /* slate-600 */
+      --link: #0ea5e9; /* sky-500 */
+      --border: #e5e7eb; /* gray-200 */
+      --chip: #f1f5f9; /* slate-100 */
+      --chip-fg: #0f172a;
+      --accent: #f97316; /* orange-500 */
+      --code-bg: #0b1220;
+      --code-fg: #e2e8f0;
+      --kbd-bg: #f8fafc;
+      --kbd-fg: #0f172a;
+      --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1220;
+        --fg: #e2e8f0;
+        --muted: #94a3b8;
+        --link: #38bdf8;
+        --border: #1f2937;
+        --chip: #111827;
+        --chip-fg: #e5e7eb;
+        --accent: #fb923c;
+        --code-bg: #0b1220;
+        --code-fg: #e2e8f0;
+        --kbd-bg: #111827;
+        --kbd-fg: #e5e7eb;
+        --shadow: 0 8px 24px rgba(2, 6, 23, 0.6);
+      }
+    }
+    html[data-theme="light"] {
+      --bg: #ffffff;
+      --fg: #0f172a;
+      --muted: #475569;
+      --link: #0ea5e9;
+      --border: #e5e7eb;
+      --chip: #f1f5f9;
+      --chip-fg: #0f172a;
+      --accent: #f97316;
+      --code-bg: #0b1220;
+      --code-fg: #e2e8f0;
+      --kbd-bg: #f8fafc;
+      --kbd-fg: #0f172a;
+      --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+    html[data-theme="dark"] {
+      --bg: #0b1220;
+      --fg: #e2e8f0;
+      --muted: #94a3b8;
+      --link: #38bdf8;
+      --border: #1f2937;
+      --chip: #111827;
+      --chip-fg: #e5e7eb;
+      --accent: #fb923c;
+      --code-bg: #0b1220;
+      --code-fg: #e2e8f0;
+      --kbd-bg: #111827;
+      --kbd-fg: #e5e7eb;
+      --shadow: 0 8px 24px rgba(2, 6, 23, 0.6);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.6 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+    nav.sidebar {
+      position: sticky; top: 0; align-self: start; height: 100vh; overflow: auto;
+      border-right: 1px solid var(--border); padding: 16px 14px; background: var(--bg);
+    }
+    nav .brand { display:flex; align-items:center; gap:12px; padding: 6px 8px; }
+    nav .brand img { width:36px; height:36px; border-radius: 9px; }
+    nav .brand span { font-weight: 700; letter-spacing: .2px; }
+    nav .muted { color: var(--muted); font-size: 12px; margin-top:2px; }
+    nav .search { position: relative; margin: 12px 6px 16px; }
+    nav .search input {
+      width: 100%; padding: 9px 36px 9px 12px; border:1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--fg);
+    }
+    nav .search .kbd { position:absolute; right:8px; top:6px; font-size: 12px; padding:2px 6px; background:var(--kbd-bg); color:var(--kbd-fg); border-radius:6px; border:1px solid var(--border); }
+    nav ul { list-style:none; padding: 8px 4px; margin: 0; }
+    nav li a { display:block; padding:8px 10px; border-radius: 8px; color: var(--fg); }
+    nav li a.active, nav li a:hover { background: var(--chip); color: var(--chip-fg); }
+    header.topbar {
+      position: sticky; top: 0; z-index: 10; backdrop-filter: blur(6px);
+      background: color-mix(in oklab, var(--bg) 80%, transparent); border-bottom:1px solid var(--border);
+    }
+    header .inner {
+      display:flex; align-items:center; justify-content: space-between; padding: 10px 22px;
+    }
+    .chip { background: var(--chip); color: var(--chip-fg); padding: 4px 8px; border-radius: 999px; font-size: 12px; border:1px solid var(--border); }
+    main.content { padding: 24px 32px 80px; max-width: 1100px; width: 100%; }
+    .prose h1 { font-size: 28px; margin: 18px 0 8px; }
+    .prose h2 { font-size: 22px; margin: 28px 0 8px; }
+    .prose h3 { font-size: 18px; margin: 22px 0 6px; }
+    .prose p { margin: 10px 0; }
+    .prose table { width:100%; border-collapse: collapse; margin: 12px 0 18px; }
+    .prose th, .prose td { border:1px solid var(--border); padding:8px 10px; text-align:left; }
+    .card { border:1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); padding:16px; margin:14px 0; background: var(--bg); }
+    pre { background: var(--code-bg); color: var(--code-fg); padding: 14px; border-radius: 12px; overflow:auto; position: relative; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 13px; }
+    .copy-btn {
+      position: absolute; top: 8px; right: 8px; border:1px solid var(--border); background: var(--chip);
+      color: var(--chip-fg); border-radius: 8px; padding: 4px 8px; cursor: pointer; font-size: 12px;
+    }
+    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .note { border-left: 4px solid var(--accent); padding: 10px 12px; background: color-mix(in oklab, var(--accent) 8%, var(--bg)); }
+    footer {
+      border-top:1px solid var(--border); margin-top: 36px; padding: 18px 22px; color: var(--muted);
+    }
+    /* Mobile */
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.sidebar { display:none; }
+      main.content { padding: 18px 16px 64px; }
+    }
+    /* Print */
+    @media print {
+      header.topbar, nav.sidebar, .copy-btn { display:none !important; }
+      body { background: white; color: black; }
+      .card { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <nav class="sidebar" aria-label="Inhaltsverzeichnis">
+      <div class="brand">
+        <img src="logo.png" alt="HALO Logo" />
+        <div>
+          <span>HALO Engine Docs</span>
+          <div class="muted">Fast‑Path & OpenCL Hybrid</div>
+        </div>
+      </div>
+      <div class="search">
+        <input id="search" type="search" placeholder="Suchen (/) …" aria-label="Suchen" />
+        <span class="kbd">/</span>
+      </div>
+      <ul id="toc">
+        <li><a href="#ueberblick" class="active">1. Überblick</a></li>
+        <li><a href="#setup">2. Setup</a></li>
+        <li><a href="#cpu-api">3. CPU Fast‑Path API</a></li>
+        <li><a href="#gpu-api">4. OpenCL GPU API</a></li>
+        <li><a href="#fehler">5. Fehlercodes</a></li>
+        <li><a href="#python">6. Python Wrapper Tipps</a></li>
+        <li><a href="#pfade">7. Temp/Pfade</a></li>
+        <li><a href="#changelog">8. Version</a></li>
+        <li><a href="#build">9. Build‑Pipeline &amp; Kompilierung</a></li>
+      </ul>
+    </nav>
+
+    <div>
+      <header class="topbar">
+        <div class="inner">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <img src="logo.png" alt="HALO Logo klein" style="width:28px; height:28px; border-radius:6px;" />
+            <strong>HALO Fast‑Path & OpenCL Hybrid Engine – SDK Dokumentation</strong>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span class="chip" title="Theme folgt standardmäßig dem System">Automatisch</span>
+            <label class="chip" style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+              <span>Theme</span>
+              <select id="themeSel" style="background:transparent; color:inherit; border:none; outline:none;">
+                <option value="auto" selected>Auto</option>
+                <option value="light">Hell</option>
+                <option value="dark">Dunkel</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </header>
+
+      <main class="content">
+        <article class="prose" id="content">
+          <section id="ueberblick">
+            <h1>1. Übersicht & Architektur</h1>
+            <p>Die <strong>halo_driver.dll</strong> vereint zwei Wege der Beschleunigung:</p>
+            <div class="grid-2">
+              <div class="card">
+                <h3>HALO Fast‑Path (CPU)</h3>
+                <p>Multithreaded, AVX2‑optimiert. Präfix <code>halo_*</code>. Bild‑ und Vektorkerne.</p>
+              </div>
+              <div class="card">
+                <h3>CipherCore OpenCL (GPU)</h3>
+                <p>Generischer OpenCL‑Treiber. Präfix <code>halo_gpu_*</code> sowie <code>execute_*</code>‑Primitiven (ML).</p>
+              </div>
+            </div>
+            <p class="note"><strong>Konvention:</strong> Strides werden in <em>Bytes</em> angegeben. Integer‑Längen in <em>Elementen</em> (Pixel, Floats). Float = 4 Bytes.</p>
+          </section>
+
+          <section id="setup">
+            <h2>2. Einrichtung & Initialisierung</h2>
+            <div class="card">
+              <h3>ctypes: DLL laden</h3>
+              <pre><button class="copy-btn" data-copy="ctypes1">Kopieren</button><code id="ctypes1">import ctypes, os
+DLL_PATH = os.path.join(os.path.dirname(__file__), "halo_driver.dll")
+halo = ctypes.CDLL(DLL_PATH)
+
+# grundlegende Typen
+c_float   = ctypes.c_float
+c_int     = ctypes.c_int
+c_longlong= ctypes.c_longlong
+c_float_p = ctypes.POINTER(c_float)
+
+# Version abfragen
+halo.halo_version.restype = ctypes.c_char_p
+print("HALO Version:", halo.halo_version().decode())</code></pre>
+            </div>
+
+            <div class="grid-2">
+              <div class="card">
+                <h3>CPU‑Initialisierung</h3>
+                <table>
+                  <tr><th>Funktion</th><th>Beschreibung</th></tr>
+                  <tr><td><code>halo_init_features()</code></td><td>Erstaufruf – ermittelt SIMD‑Features.</td></tr>
+                  <tr><td><code>halo_configure(enable_streaming, thr_bytes, threads)</code></td><td>Thread‑Pool &amp; Non‑Temporal Stores.</td></tr>
+                  <tr><td><code>halo_autotune(n, iters, &amp;saxpy_impl, &amp;sum_impl)</code></td><td>Wählt schnellste Kernen‑Impls.</td></tr>
+                  <tr><td><code>halo_shutdown_pool()</code></td><td>Sauber beenden (atexit empfohlen).</td></tr>
+                </table>
+              </div>
+              <div class="card">
+                <h3>GPU‑Initialisierung</h3>
+                <pre><button class="copy-btn" data-copy="gpu1">Kopieren</button><code id="gpu1">from ctypes import c_int
+# Gerät 0 initialisieren
+rc = halo.halo_gpu_prepare(c_int(0))
+if rc != 0:
+    raise RuntimeError(f"GPU Init fehlgeschlagen: {rc}")
+# … GPU‑Funktionen verwenden …
+halo.halo_gpu_release(c_int(0))</code></pre>
+              </div>
+            </div>
+          </section>
+
+          <section id="cpu-api">
+            <h2>3. CPU Fast‑Path API (float32)</h2>
+            <h3>3.1 Vektor</h3>
+            <table>
+              <tr><th>Funktion</th><th>Signatur</th><th>Beschreibung</th></tr>
+              <tr><td><code>halo_saxpy_f32</code></td><td>(float a, const float* x, float* y, long long n)</td><td>y = a·x + y</td></tr>
+              <tr><td><code>halo_saxpy_f32_mt</code></td><td>(float a, const float* x, float* y, long long n)</td><td>Multi‑Thread Variante</td></tr>
+              <tr><td><code>halo_sum_f32</code></td><td>(const float* x, long long n, float* out)</td><td>Reduktion</td></tr>
+            </table>
+
+            <h3>3.2 Bildkerne</h3>
+            <ul>
+              <li><code>halo_box_blur_f32</code>, <code>halo_gaussian_blur_f32</code></li>
+              <li><code>halo_median3x3_f32</code>, <code>halo_sobel_f32</code></li>
+              <li><code>halo_erode3x3_f32</code>, <code>halo_dilate3x3_f32</code></li>
+              <li><code>halo_unsharp_mask_f32</code>, <code>halo_resize_bilinear_f32</code>, <code>halo_resize_bicubic_f32</code></li>
+              <li><code>halo_relu_clamp_axpby_f32</code>, <code>halo_invert_f32</code>, <code>halo_gamma_f32</code>, <code>halo_levels_f32</code>, <code>halo_threshold_f32</code></li>
+            </ul>
+
+            <div class="card">
+              <h3>Beispiel: Gaussian Blur</h3>
+              <pre><button class="copy-btn" data-copy="cpu1">Kopieren</button><code id="cpu1"># Annahme: src, dst sind float32-Arrays, row-major; stride in BYTES!
+rc = halo.halo_gaussian_blur_f32(
+    src_ptr, c_longlong(src_stride),
+    dst_ptr, c_longlong(dst_stride),
+    c_int(width), c_int(height),
+    c_float(sigma),
+    c_int(1)  # use_mt
+)
+if rc != 0:
+    raise RuntimeError(f"gaussian_blur rc={rc}")</code></pre>
+            </div>
+          </section>
+
+          <section id="gpu-api">
+            <h2>4. OpenCL GPU API</h2>
+            <p>Modaler Treiber: Ein Gerät gleichzeitig. Host‑Floatpuffer werden intern transferiert.</p>
+            <div class="card">
+              <h3>Bild‑Kerne</h3>
+              <ul>
+                <li><code>halo_gpu_box_blur_f32</code>, <code>halo_gpu_gaussian_blur_f32</code>, <code>halo_gpu_sobel_f32</code>, <code>halo_gpu_median3x3_f32</code></li>
+                <li><code>halo_gpu_invert_f32</code>, <code>halo_gpu_gamma_f32</code>, <code>halo_gpu_levels_f32</code>, <code>halo_gpu_threshold_f32</code>, <code>halo_gpu_unsharp_mask_f32</code></li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Generische ML‑Primitiven</h3>
+              <table>
+                <tr><th>Funktion</th><th>Signatur (Kurz)</th><th>Hinweis</th></tr>
+                <tr><td><code>allocate_buffer</code></td><td>(size_t bytes) → void*</td><td>GPU Speicher (cl_mem)</td></tr>
+                <tr><td><code>upload_buffer</code></td><td>(void* h, const void* src, size_t bytes)</td><td>Host → GPU</td></tr>
+                <tr><td><code>execute_matmul_on_gpu</code></td><td>(void* A,B,C, int B,M,N,K)</td><td>Batch @ (K×N)</td></tr>
+                <tr><td><code>execute_adam_update_on_gpu</code></td><td>(void* p,g,m,v, …)</td><td>Optimierer</td></tr>
+              </table>
+            </div>
+          </section>
+
+          <section id="fehler">
+            <h2>5. Fehlerbehandlung</h2>
+            <table>
+              <tr><th>Code</th><th>Bedeutung</th><th>Kontext</th></tr>
+              <tr><td>0 / 1</td><td>Erfolg</td><td>Allgemein</td></tr>
+              <tr><td>-1 … -99</td><td>C/C++ Eingabe/Allokationsfehler</td><td>Host</td></tr>
+              <tr><td>-100 … -199</td><td>GPU‑Initialisierung/Runtime</td><td>OpenCL Treiber</td></tr>
+              <tr><td>&lt; -200</td><td>Direkter OpenCL Code (z. B. -34 Build‑Fehler)</td><td>OpenCL</td></tr>
+            </table>
+            <pre><button class="copy-btn" data-copy="err1">Kopieren</button><code id="err1">rc = halo.halo_threshold_f32(...)
+if rc &lt; 0:
+    raise RuntimeError(f"HALO Fehlercode: {rc}")</code></pre>
+          </section>
+
+          <section id="python">
+            <h2>6. Python Wrapper Tipps</h2>
+            <ul>
+              <li><strong>Strides in Bytes</strong> übergeben (z. B. <code>width * 4</code> für float32 ohne Padding).</li>
+              <li><strong>atexit</strong>: <code>halo_shutdown_pool()</code> sowie ggf. <code>halo_gpu_release()</code> registrieren.</li>
+              <li><strong>Thread‑Pool‑Tuning</strong>: <code>halo_configure(1, 1_000_000, threads)</code>.</li>
+              <li><strong>Autotune</strong> beim ersten Start, Werte in Profil‑Datei speichern.</li>
+            </ul>
+          </section>
+
+          <section id="pfade">
+            <h2>7. Temp/Pfade & Sicherheit</h2>
+            <p>Verwenden Sie einen projektlokalen Temp‑Ordner (z. B. <code>./_tmp</code>) und setzen Sie <code>GRADIO_TEMP_DIR</code>, um den Zugriff auf fremde Temp‑Pfade zu vermeiden. Löschen Sie Input‑Kopien unmittelbar nach Verarbeitung und registrieren Sie Outputs zur späteren Bereinigung.</p>
+          </section>
+
+          <section id="build">
+            <h2>9. Build‑Pipeline &amp; Kompilierung</h2>
+            <p>Die <code>halo_driver.dll</code> wird aus drei Quelldateien erstellt und bindet den OpenCL‑Treiber statisch/halb‑statisch ein.</p>
+            <div class="card">
+              <h3>Build‑Pipeline &amp; Laufzeit‑Datenfluss</h3>
+              
+              <p>Dieser Abschnitt beschreibt den Prozess, wie die <code>halo_driver.dll</code> aus verschiedenen Quellcodes erstellt wird und wie sie dann zur Laufzeit mit den benötigten Abhängigkeiten interagiert.</p>
+
+              <h4>1. Quellen (Sources)</h4>
+              <p>Der Bauprozess beginnt mit den folgenden Schlüsselkomponenten, die als Quellmaterial dienen:</p>
+              <ul>
+                  <li><strong><code>halo_driver.cpp</code></strong>: Dies ist die Hauptquellcodedatei in C++, die die Kernlogik des HALO-Treibers enthält und als Schnittstelle dient.</li>
+                  <li><strong><code>fastpath.cpp</code></strong>: Eine weitere C++-Quelldatei, die für die CPU-spezifischen "Fast-Path"-Optimierungen zuständig ist (z.B. AVX2-Vektoroperationen und Multithreading).</li>
+                  <li><strong><code>CipherCore_OpenCL.c</code></strong>: Eine C-Quelldatei, die den generischen OpenCL-Treiber und die GPU-spezifischen Funktionen implementiert.</li>
+                  <li><strong><code>./CL/*.h OpenCL Header</code></strong>: Dies sind die notwendigen OpenCL-Header-Dateien (z.B. <code>cl.h</code>), die die Deklarationen und Typen für die Interaktion mit dem OpenCL-Framework bereitstellen. Diese werden während des Kompilierungsprozesses benötigt.</li>
+              </ul>
+
+              <h4>2. Kompilierung & Link (Compile & Link)</h4>
+              <p>Die Quellcodes durchlaufen dann die Kompilierungs- und Link-Phase:</p>
+              <ul>
+                  <li><strong><code>g++ -std=c++17 ... -c</code> (Kompilierung)</strong>: Alle C++- und C-Quelldateien (<code>halo_driver.cpp</code>, <code>fastpath.cpp</code>, <code>CipherCore_OpenCL.c</code>) sowie die OpenCL-Header (<code>./CL/*.h</code>) werden mit dem <code>g++</code>-Compiler kompiliert. Dabei werden Optionen wie <code>-std=c++17</code> für den C++-Standard und <code>-c</code> für die Erzeugung von Objektdateien verwendet. In dieser Phase werden die Quelldateien in Maschinencode übersetzt, aber noch nicht zu einem ausführbaren Modul zusammengefügt.</li>
+                  <li><strong><code>g++ -shared ... -lOpenCL</code> (Linken)</strong>: Die erzeugten Objektdateien werden dann von <code>g++</code> zu einer gemeinsamen Bibliothek (<code>.dll</code> unter Windows) gelinkt. Die Option <code>-shared</code> ist entscheidend, um eine Dynamic Link Library (DLL) zu erstellen. Wichtig ist hier die Verknüpfung mit der OpenCL-Bibliothek (<code>-lOpenCL</code>), welche die notwendigen Funktionen für die GPU-Kommunikation bereitstellt.</li>
+              </ul>
+
+              <h4>3. Artefakt (Artifact)</h4>
+              <p>Das Ergebnis der Kompilierungs- und Link-Phase ist das Hauptartefakt:</p>
+              <ul>
+                  <li><strong><code>halo_driver.dll</code></strong>: Dies ist die fertige Dynamic Link Library (DLL), die alle CPU-Fast-Path- und GPU-OpenCL-Funktionen des HALO-Treibers enthält.</li>
+              </ul>
+
+              <h4>4. Laufzeit (Runtime)</h4>
+              <p>Zur Laufzeit benötigt die <code>halo_driver.dll</code> eine weitere Abhängigkeit, um die GPU-Funktionen ausführen zu können:</p>
+              <ul>
+                  <li><strong><code>OpenCL Runtime DLL (OpenCL.dll / amd_opencl64.dll / nvopencl64.dll)</code></strong>: Dies ist die herstellerspezifische OpenCL-Treiber-DLL (z.B. von Intel, AMD oder NVIDIA), die auf dem System des Benutzers installiert sein muss. Die <code>halo_driver.dll</code> lädt und nutzt diese Laufzeit-DLL, um Befehle an die GPU zu senden. Ohne eine passende OpenCL-Runtime kann die <code>halo_driver.dll</code> ihre GPU-Funktionen nicht bereitstellen.</li>
+              </ul>
+
+              <p class="muted">Hinweis: Der CPU‑Pfad (SIMD/Thread‑Pool) und der GPU‑Pfad (OpenCL Runtime) werden beide aus der <code>halo_driver.dll</code> exportiert.</p>
+            </div>
+
+            <div class="card">
+              <h3>Kompilieren (MinGW‑w64 / g++)</h3>
+              <p>Alle drei Quelldateien müssen gelinkt werden. Beispiel‑Kommando:</p>
+              <pre><button class="copy-btn" data-copy="buildcmd">Kopieren</button><code id="buildcmd">g++ -std=c++17 -O3 -march=native -shared \
+  halo_driver.cpp fastpath.cpp CipherCore_OpenCL.c \
+  -o halo_driver.dll \
+  -I./CL -L./CL -lOpenCL \
+  -DCL_TARGET_OPENCL_VERSION=120 \
+  -static-libstdc++ -static-libgcc</code></pre>
+              <ul>
+                <li><strong>-I./CL</strong> &amp; <strong>-L./CL</strong>: Pfade zu Ihren OpenCL‑Headers/Libs.</li>
+                <li><strong>-static-libstdc++ -static-libgcc</strong>: Verlinkt die GCC‑Laufzeit statisch (portabler).</li>
+                <li><strong>-march=native</strong>: Aktiviert CPU‑spezifische Optimierungen (für Redistributables ggf. durch <code>-march=x86-64-v3</code> ersetzen).</li>
+              </ul>
+            </div>
+          </section>
+
+
+          <!--
+            Der Abschnitt id="build" wurde in der obigen Sektion 9 komplett integriert und ersetzt.
+            Der folgende Abschnitt #build_alt, der in den vorherigen Schritten vorhanden war, 
+            wird hier entfernt, um Duplikate zu vermeiden.
+          -->
+
+
+          <section id="changelog">
+            <h2>8. Version & Kompatibilität</h2>
+            <table>
+              <tr><th>Attribut</th><th>Wert</th></tr>
+              <tr><td>Version</td><td><strong>0.5b</strong></td></tr>
+              <tr><td>ABI</td><td>HALO 0.5.x</td></tr>
+            </table>
+            <p>© 2025 Ralf Krümmel – MIT‑Lizenz</p>
+          </section>
+        </article>
+
+        <footer>
+          HALO SDK · Diese Seite folgt standardmäßig dem System‑Theme. Nutzen Sie den Theme‑Schalter rechts oben, um es zu überschreiben.
+        </footer>
+      
+</main>
+    </div>
+  </div>
+
+  <script>
+    // Theme handling
+    const sel = document.getElementById('themeSel');
+    const root = document.documentElement;
+    function applyTheme(val) {
+      if (val === 'auto') root.removeAttribute('data-theme');
+      else root.setAttribute('data-theme', val);
+      localStorage.setItem('halo-theme', val);
+    }
+    sel.addEventListener('change', () => applyTheme(sel.value));
+    const saved = localStorage.getItem('halo-theme') || 'auto';
+    sel.value = saved; applyTheme(saved);
+
+    // Copy buttons
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-copy');
+        const code = document.getElementById(id).innerText;
+        navigator.clipboard.writeText(code).then(() => {
+          btn.textContent = 'Kopiert ✓';
+          setTimeout(() => (btn.textContent = 'Kopieren'), 1200);
+        });
+      });
+    });
+
+    // Mini search (filters headings containing the query)
+    const search = document.getElementById('search');
+    const content = document.getElementById('content');
+    search.addEventListener('input', () => {
+      const q = search.value.toLowerCase().trim();
+      document.querySelectorAll('#content section').forEach(sec => {
+        const txt = sec.innerText.toLowerCase();
+        sec.style.display = q && !txt.includes(q) ? 'none' : '';
+      });
+    });
+    // Keyboard shortcut '/'
+    window.addEventListener('keydown', (e) => {
+      if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+        e.preventDefault(); search.focus();
+      }
+    });
+
+    // TOC active link on scroll
+    const links = Array.from(document.querySelectorAll('#toc a'));
+    const sections = links.map(a => document.querySelector(a.getAttribute('href')));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(l => l.classList.remove('active'));
+          const i = sections.indexOf(e.target);
+          if (i >= 0) links[i].classList.add('active');
+        }
+      });
+    }, { rootMargin: '0px 0px -70% 0px', threshold: 0.1 });
+    sections.forEach(s => s && obs.observe(s));
+  </script>
+</body>
+</html>
