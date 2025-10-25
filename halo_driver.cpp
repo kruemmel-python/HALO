@@ -317,8 +317,9 @@ cl_int build_image_program_locked() {
         return CL_SUCCESS;
     }
     size_t source_length = std::strlen(kImageKernelSource);
+    const char* source_ptr = kImageKernelSource;
     cl_int err = CL_SUCCESS;
-    g_image_program = clCreateProgramWithSource(context, 1, &kImageKernelSource, &source_length, &err);
+    g_image_program = clCreateProgramWithSource(context, 1, &source_ptr, &source_length, &err);
     if (err != CL_SUCCESS) {
         return err;
     }

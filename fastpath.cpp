@@ -49,6 +49,17 @@
 
 #if !defined(_MSC_VER) && HALO_X86
   #include <cpuid.h>
+  // MinGW's <cpuid.h> defines helper macros named __cpuid / __cpuidex that
+  // collide with the prototypes provided by <intrin.h> when we are pulled into
+  // a translation unit that also includes the Windows OpenCL headers.  We only
+  // use the GNU-style __get_cpuid helpers, so undefine the conflicting macros
+  // to keep the Windows prototypes intact.
+#ifdef __cpuid
+#undef __cpuid
+#endif
+#ifdef __cpuidex
+#undef __cpuidex
+#endif
 #endif
 
 #if defined(_WIN32)
