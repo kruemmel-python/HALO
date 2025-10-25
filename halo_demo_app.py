@@ -2,13 +2,35 @@ import gradio as gr
 import numpy as np
 import math
 import ctypes as C
-import cv2 
+import cv2
 from typing import Optional, Tuple, List, Union, Any, Literal
 from array import array
 import os
 from pathlib import Path
 import platform
 import json
+
+# --- FORCIERT korrekte DLL & CL-Runtime aus dem Projektordner laden ---
+DLL_DIR = Path.cwd()
+CL_DIR = DLL_DIR / "CL"
+
+add_dll_directory = getattr(os, "add_dll_directory", None)
+if callable(add_dll_directory):
+    add_dll_directory(str(DLL_DIR))
+    if CL_DIR.exists():
+        add_dll_directory(str(CL_DIR))
+
+path_entries = [str(DLL_DIR)]
+if CL_DIR.exists():
+    path_entries.append(str(CL_DIR))
+path_entries.append(os.environ.get("PATH", ""))
+os.environ["PATH"] = os.pathsep.join(path_entries)
+
+try:
+    _halo_native = C.CDLL(str(DLL_DIR / "halo_driver.dll"))
+except OSError as _e:
+    print("[WARN] Konnte halo_driver.dll nicht vorladen:", _e)
+    _halo_native = None
 
 # ====================================================================
 # ABSCHNITT 1: HALO-Klassen, Konvertierungs-Hilfsmittel und Imports
@@ -31,11 +53,27 @@ try:
 
     halo_instance = HALO(threads=4, use_gpu=True)
     print(f"HALO-Bibliothek ({halo_instance.features}) erfolgreich geladen.")
+    # --- GPU-Flag mit nativer Funktion abgleichen, falls der Wrapper es nicht setzt ---
+    try:
+        if not getattr(halo_instance, "gpu_enabled", False) and _halo_native is not None:
+            init_gpu = _halo_native.initialize_gpu
+            init_gpu.argtypes = [C.c_int]
+            init_gpu.restype = C.c_int
+            rc = init_gpu(0)
+            if rc == 0:
+                setattr(halo_instance, "gpu_enabled", True)
+                if not getattr(halo_instance, "gpu_device", None):
+                    setattr(halo_instance, "gpu_device", "gfx90c (forced)")
+                print("GPU-Beschleunigung aktiviert (erzwungene Initialisierung via halo_driver.dll).")
+            else:
+                print(f"[INFO] initialize_gpu(0) meldete rc={rc} – bleibe auf CPU.")
+    except Exception as e:
+        print("[WARN] Konnte initialize_gpu nicht aufrufen:", e)
     if getattr(halo_instance, "gpu_enabled", False):
         print(f"GPU-Beschleunigung aktiviert (Gerät {halo_instance.gpu_device}).")
     else:
         print("GPU-Beschleunigung nicht verfügbar – CPU-Pfade aktiv.")
-    
+
 except ImportError as e:
     print(f"FEHLER: HALO-Import fehlgeschlagen. Einige Funktionen sind deaktiviert. {e}")
     class DummyHALO:
