@@ -19,21 +19,28 @@ Das Design von HALO basiert auf folgenden Säulen:
 
 ## Kompilierungsanweisungen (C++ Driver)
 
-Der C++-Treiber `halo_fastpath.dll` (Windows) oder `libhalo_fastpath.so` (Linux/macOS) muss aus der Datei `fastpath.cpp` kompiliert werden.
+Der C++-Treiber muss aus der Datei `fastpath.cpp` kompiliert werden.
 
 **WICHTIG:** Die kompilierte Shared Library (*.dll* oder *.so*) muss sich **im selben Ordner wie die Python-Datei `halo.py`** befinden.
 
 ### 1. Unter MinGW/GCC (Windows / Linux)
 
-Verwenden Sie das Flag `-pthread`, um die C++-Thread-Bibliothek für den `ThreadPool` zu linken.
+Verwenden Sie die bewährte Kommando-Struktur, um die beste Kompatibilität und Leistung zu gewährleisten. Das Flag **`-pthread`** ist für die Thread-Funktionalität erforderlich.
 
 ```bash
 # Für Windows (DLL):
-g++ -shared -o halo_fastpath.dll fastpath.cpp -O3 -Wall -std=c++17 -pthread -march=native
+g++ -O3 -march=native -pthread -shared -o halo_fastpath.dll fastpath.cpp
 
 # Für Linux/macOS (SO):
-g++ -shared -o libhalo_fastpath.so fastpath.cpp -O3 -Wall -std=c++17 -pthread -march=native
+g++ -O3 -march=native -pthread -shared -o libhalo_fastpath.so fastpath.cpp
 ```
+
+| Flag | Bedeutung |
+| :--- | :--- |
+| `-O3` | Aggressive Compiler-Optimierung. |
+| `-march=native`| Erzeugt Code für die native CPU-Architektur (wichtig für AVX2/FMA). |
+| `-pthread` | Bindet die POSIX Threads Library ein (für `std::thread`). |
+| `-shared` | Erstellt eine Shared Library (DLL/SO). |
 
 ### 2. Unter MSVC (Microsoft Visual C++)
 
@@ -43,20 +50,24 @@ Verwenden Sie den *x64 Native Tools Command Prompt* oder den *Developer Command 
 cl /LD /EHsc /O2 /arch:AVX2 /std:c++17 fastpath.cpp /Fe:halo_fastpath.dll
 ```
 
+| Flag | Bedeutung |
+| :--- | :--- |
+| `/LD` | Erstellt eine DLL. |
+| `/O2` | Optimierungslevel 2 (Geschwindigkeit). |
+| `/arch:AVX2`| Aktiviert AVX2 SIMD-Instruktionen. |
+| `/std:c++17`| Verwendet den C++17-Standard. |
+
 ## Python Wrapper Nutzung
 
 ### 1. Installation und Setup
 
 1.  **Stellen Sie die HALO-Dateien bereit:**
-    Platzieren Sie `halo.py`, `fastpath.cpp` und die kompilierte `halo_fastpath.dll` (oder `.so`) im selben Python-Quellverzeichnis.
+    Platzieren Sie `halo.py` und die kompilierte Library (`*.dll` oder `*.so`) im selben Python-Quellverzeichnis.
 
 2.  **Installieren Sie Python-Abhängigkeiten:**
     ```bash
     pip install numpy gradio
     ```
-
-3.  **Thread-Pool Shutdown:**
-    Der Python-Wrapper registriert automatisch einen `atexit`-Hook, um den persistenten Thread-Pool sauber zu beenden.
 
 ### 2. Grundlegendes Anwendungsbeispiel
 
@@ -65,17 +76,19 @@ Der Zugriff auf alle optimierten Funktionen erfolgt über die Hauptklasse `HALO`
 ```python
 import numpy as np
 from halo import HALO, make_aligned_f32_buffer 
+import math # Für Sigma-Berechnung
 
 # 1. Initialisiere HALO (startet den Thread-Pool und führt Autotuning durch)
 halo = HALO(threads=4)
 
-# 2. Vorbereitung der Puffer
+# 2. Vorbereitung der Puffer (1920x1080)
 W, H = 1920, 1080
+
 # Erstellt einen aligned memoryview ('f') und den Stride in Bytes
 src_mv, src_stride = make_aligned_f32_buffer(W, H, components=1) 
 dst_mv, dst_stride = make_aligned_f32_buffer(W, H, components=1)
 
-# Fülle den Puffer mit Daten (0.0 bis 1.0)
+# Fülle den Puffer mit Beispieldaten (z.B. aus einem NumPy Array)
 src_mv[:] = np.random.rand(W*H).astype(np.float32)
 
 # 3. Aufruf eines optimierten Kernels (Gaussian Blur)
@@ -90,9 +103,9 @@ halo.gaussian_blur_f32(
 print(f"Gaussian Blur (Sigma={sigma}) erfolgreich ausgeführt.")
 ```
 
-### 3. Gradio-Demo (Web-App)
+### 3. Interaktive Gradio-Demo (Web-App)
 
-Die `halo_demo_app.py` demonstriert die Integration aller Funktionen in eine interaktive Web-App. Führen Sie das Skript aus, um die Leistungsfähigkeit der HALO-Funktionen direkt im Browser zu testen:
+Führen Sie das Gradio-Demo-Skript aus, um alle HALO-Funktionen interaktiv zu testen:
 
 ```bash
 python halo_demo_app.py
