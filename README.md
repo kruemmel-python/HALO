@@ -1,118 +1,117 @@
-# HALO Project
+# HALO: High-throughput Array and Logic Operations (v0.5b)
 
-**HALO** (**H**igh-throughput **A**rray and **L**ogic **O**perations) ist eine hochoptimierte C++-Bibliothek für array-basierte numerische und Bilddatenverarbeitung, die die rohe Leistung von C++ (SIMD, Multi-Threading) mit der Agilität von Python verbindet. Es wurde entwickelt, um Performance-Engpässe in Anwendungen zu überwinden, die Echtzeitverarbeitung und die Handhabung großer Bildvolumina erfordern.
+**HALO** ist eine hybride C++/OpenCL-Bibliothek für Hochleistungs-Bildverarbeitung und numerische Operationen. Sie kombiniert handoptimierte CPU-Routinen (AVX2, Multi-Threading) mit einem generischen OpenCL-Backend für GPU-Beschleunigung, nahtlos integriert in Python.
 
-*Veröffentlicht: 2025-10-25 / Autor: Ralf Krümmel*
-
----
-
-## 1. HALO-Architektur und Kern-Optimierungen
-
-Das Herzstück von HALO ist ein C++-Kern (`fastpath.cpp`), der für maximale Hardware-Auslastung auf modernen x86-Prozessoren optimiert ist.
-
-### 1.1. Core-Features und C++-Optimierung
-
-| Kategorie | Implementierung | Nutzen & Performance |
-| :--- | :--- | :--- |
-| **SIMD Vektorisierung** | Direkter Einsatz von **AVX2** und **FMA** (Fused Multiply-Add). | Bis zu **8x Geschwindigkeit** gegenüber Skalar-Code für Kern-Operationen. |
-| **Multi-Threading (MT)** | **Persistenter Worker-Thread-Pool** mit intelligentem **Auto-Scheduler**. | Eliminiert Thread-Spawning-Overhead. Nahezu **lineare Skalierung** bei parallelisierbaren Aufgaben. |
-| **Speicher I/O** | Unterstützung für **Non-Temporal (Streaming) Stores** (z.B. für SAXPY). | Reduziert **Cache-Druck** und optimiert den Speicherdurchsatz. |
-| **Erweiterte Optimierung** | Affine-LUT **Fast-Path** und AVX2-**Gather**-Instruktionen. | Beschleunigt Look-Up-Tabellen und komplexe Interpolationen (Bikubisch/Bilinear). |
-| **Python Bridge** | Schlanker **`ctypes`**-Wrapper (`halo.py`) mit Autotuning-Funktionalität. | Ermöglicht **Aligned/Pinned Memory** für Zero-Copy-Datenübergabe. |
-
-### 1.2. Funktionale Übersicht (C++ Kern)
-
-| Kernel-Typ | Verfügbare Operationen |
-| :--- | :--- |
-| **Filter & Reduktion** | SAXPY, SUM, Box Blur, Gaussian Blur (separabel), Sobel, Median ($3 \times 3$), Unsharp Masking. |
-| **Tonwert** | Invert, Gamma-Korrektur, Levels, Threshold, ReLU/Clamp-AXPBY. |
-| **Geometrie** | Flip, Rotate90, Resize (Bilinear & Bikubisch). |
-| **Morphologie** | Erode, Dilate, Open, Close ($3 \times 3$, separabel). |
+*Version: 0.5b / Autor: Ralf Krümmel*
 
 ---
 
-## 2. High-Level Erweiterungen (Python/NumPy)
+## 1. Architektur & Kern-Features
 
-Das Modul `halo_extensions.py` nutzt NumPy (optional CuPy) für komplexere Operationen, die nahtlos auf den C++-Grundlagen aufbauen.
+HALO v0.5b verfolgt einen hybriden Ansatz, bei dem eine einzige dynamische Bibliothek (`halo_driver.dll` / `.so`) sowohl die CPU- als auch die GPU-Pfade verwaltet.
 
-| Modul | Features | Datentypen |
-| :--- | :--- | :--- |
-| **`halo_extensions.py`** | **Bilateral Filter**, **Canny Edge Detector**. Erweiterte Morphologie (Gradient, Top-Hat). | Unterstützt **uint8, uint16, float32, float64** (automatische Normalisierung). |
-| **`halo_extensions.py`** | **Farbraum-Konvertierungen** (RGB, HSV, YCbCr, Gray). Affine/Perspektiv-**Warping** (`AffineTransform`). | |
-| **`halo_gpu.py`** | Experimentelle GPU-Bridge (SAXPY, Sum, Convolve). | Nutzt **CuPy (CUDA)** als Backend, fällt auf NumPy zurück. |
+### 1.1. Hybrid-Engine (`halo_driver.dll`)
+
+Die Treiber-DLL vereint zwei spezialisierte Kerne:
+
+*   **Fast-Path CPU (`fastpath.cpp`):**
+    *   **SIMD-optimiert:** Nutzt AVX2/FMA für maximale Vektorleistung auf modernen CPUs.
+    *   **Persistenter Thread-Pool:** Minimiert Overhead durch Wiederverwendung von Worker-Threads.
+    *   **Auto-Tuning:** Wählt zur Laufzeit die schnellste Implementierung (Skalar, SSE2, AVX2, AVX2-Streaming) basierend auf der Hardware.
+*   **CipherCore GPU (`CipherCore_OpenCl.c`):**
+    *   **OpenCL-Backend:** Ermöglicht Hardwarebeschleunigung auf einer Vielzahl von GPUs (NVIDIA, AMD, Intel).
+    *   **Just-in-Time Kompilierung:** OpenCL-Kernel werden zur Laufzeit für das spezifische Gerät optimiert kompiliert.
+    *   **Breite Palette:** Von einfachen Bildfiltern bis hin zu komplexen ML-Primitiven (Matmul, Adam Optimizer, Embedding Lookups).
+
+### 1.2. Python-Integration
+
+*   **`halo.py`**: Der Low-Level Wrapper. Er lädt die DLL, verwaltet Speicher (Aligned/Pinned Buffers) und entscheidet transparent oder explizit, ob CPU- oder GPU-Pfade genutzt werden. Enthält zudem `atexit`-Hooks für sauberes Ressourcen-Management.
+*   **`halo_extensions.py`**: High-Level NumPy-Implementierungen für komplexe Operationen, die (noch) nicht im C++-Kern sind (z.B. Canny Edge, Bilateral Filter, Warping).
+*   **`halo_demo_app.py`**: Eine umfassende **Gradio**-Weboberfläche zur Demonstration aller Features, inklusive Echtzeit-Videoverarbeitung und sicherem Temp-File-Management.
 
 ---
 
-## 3. Kompilierungsanweisungen (C++ Driver)
+## 2. Funktionsumfang
 
-Die kompilierte Shared Library (`halo_fastpath.dll` oder `libhalo_fastpath.so`) muss sich **im selben Ordner wie `halo.py`** befinden.
+| Kategorie | CPU (Fast-Path) | GPU (OpenCL) | Python (Extensions) |
+| :--- | :--- | :--- | :--- |
+| **Basis-Ops** | SAXPY, Sum (Reduction) | Add, Mul, Clone | - |
+| **Bildfilter** | Box, Gaussian, Sobel, Median (3x3), Unsharp Mask | Box, Gaussian, Sobel, Median, Unsharp Mask | Bilateral Filter |
+| **Morphologie**| Erode, Dilate, Open, Close (3x3) | - | Erweiterte Morphologie (Gradient, Tophat, etc.) |
+| **Tonwert** | Invert, Gamma, Levels, Threshold, ReLU/Clamp | Invert, Gamma, Levels, Threshold | - |
+| **Geometrie** | Flip, Rotate90, Resize (Bilinear/Bicubic) | - | Affine & Perspective Warping |
+| **ML / Tensor**| - | MatMul (Batched), Softmax/LogSoftmax, GELU, LayerNorm, Adam, Embeddings, CrossEntropy | - |
+| **Farbe** | RGB Interleaved/Planar $\leftrightarrow$ f32 | - | RGB $\leftrightarrow$ HSV/Gray/YCbCr |
 
-### 3.1. Unter MinGW/GCC (Windows / Linux)
+---
 
-Verwenden Sie das Kommando, das die Thread- und Architektur-Flags korrekt anordnet, um Linker-Fehler zu vermeiden:
+## 3. Build & Installation
 
+### 3.1. Voraussetzungen
+*   **Compiler:** C++17 kompatibel (GCC/MinGW-w64 oder MSVC).
+*   **OpenCL SDK:** Header (`CL/cl.h`) und Import-Library (z.B. `OpenCL.lib` oder `-lOpenCL`).
+*   **Python:** 3.9+ mit `numpy` und `gradio` (für die Demo).
+
+### 3.2. Kompilierung (`halo_driver.dll`)
+
+Da `halo_driver.cpp` die anderen Quellcodedateien inkludiert (Unity-Build), reicht es oft, nur diese Datei zu kompilieren.
+
+**MinGW-w64 (Windows) / GCC (Linux):**
 ```bash
-# Empfohlenes Kommando
-g++ -O3 -march=native -pthread -shared -o halo_fastpath.dll fastpath.cpp
+g++ -std=c++17 -O3 -march=native -shared -o halo_driver.dll halo_driver.cpp -lOpenCL -I./CL -L./CL
+# Unter Linux stattdessen: -o libhalo_driver.so
 ```
-*(Verwenden Sie `-o libhalo_fastpath.so` für Linux/macOS.)*
-
-### 3.2. Unter MSVC (Microsoft Visual C++)
-
-Führen Sie den Befehl im *x64 Native Tools Command Prompt* aus:
-
-```cmd
-cl /LD /EHsc /O2 /arch:AVX2 /std:c++17 fastpath.cpp /Fe:halo_fastpath.dll
-```
+*Hinweis: Passen Sie `-I` und `-L` an den Pfad Ihres OpenCL-SDKs an, falls nicht im Systempfad.*
 
 ---
 
-## 4. Python Wrapper Nutzung
+## 4. Nutzung
 
-### 4.1. Setup und Installation
-
-1.  **Stellen Sie die HALO-Dateien bereit:**
-    `halo.py`, `halo_extensions.py`, `halo_gpu.py` und die kompilierte Library (`*.dll` oder `*.so`) in das Quellverzeichnis kopieren.
-
-2.  **Installieren Sie Python-Abhängigkeiten:**
-    ```bash
-    pip install numpy gradio
-    # Optional für GPU-Funktionalität:
-    pip install cupy-cuda12x 
-    ```
-
-### 4.2. Grundlegendes Beispiel
+### 4.1. Python API Basic
 
 ```python
 import numpy as np
-from halo import HALO, make_aligned_f32_buffer 
-from halo_extensions import bilateral_filter # High-Level Funktion
+from halo import HALO, make_aligned_f32_buffer
 
-# 1. Initialisiere HALO (startet den Thread-Pool)
-halo = HALO(threads=4)
+# Initialisierung (startet CPU-Pool, prüft auf GPU)
+halo = HALO(threads=8, use_gpu=True)
 
-# 2. Verwenden des C++-Kerns (speicheroptimiert)
-W, H = 1024, 1024
-src_mv, src_stride = make_aligned_f32_buffer(W, H, components=1) 
-src_mv[:] = np.random.rand(W*H).astype(np.float32)
+if halo.gpu_enabled:
+    print(f"GPU aktiv auf Gerät {halo.gpu_device}")
 
-halo.gaussian_blur_f32(
-    src=src_mv, dst=src_mv, width=W, height=H, 
-    src_stride_bytes=src_stride, dst_stride_bytes=src_stride, 
-    sigma=1.0, use_mt=True
-)
+# Speicher erstellen (64-byte aligned für AVX2)
+width, height = 1920, 1080
+buf, stride = make_aligned_f32_buffer(width, height)
+data = np.frombuffer(buf, dtype=np.float32).reshape(height, width) # View als NumPy Array
 
-# 3. Verwenden der High-Level Extension (NumPy-basiert, Dtype-kompatibel)
-img_uint8 = np.zeros((H, W, 3), dtype=np.uint8)
-img_final = bilateral_filter(img_uint8, diameter=5, sigma_color=0.1)
-
-print("HALO-Verarbeitung erfolgreich ausgeführt.")
+# Beispiel: Gaussian Blur (wählt automatisch GPU wenn verfügbar & implementiert)
+halo.gaussian_blur_f32(buf, buf, width, height, stride, stride, sigma=2.5)
 ```
 
-### 4.3. Interaktive Demo
+### 4.2. Demo-Applikation
 
-Führen Sie das Gradio-Demo-Skript aus, um alle C++-optimierten und High-Level-Funktionen interaktiv im Browser zu testen:
+Die Gradio-App bietet eine grafische Oberfläche für fast alle Funktionen:
 
 ```bash
 python halo_demo_app.py
 ```
+*   **Features der Demo:**
+    *   Bildverarbeitung mit Vorher/Nachher-Vergleich.
+    *   Umschaltbar zwischen C++-Filtern und Python-Extensions.
+    *   **Video-Pipeline:** Lädt Videos hoch, verarbeitet sie Frame-by-Frame (z.B. Canny) und speichert das Ergebnis.
+    *   Sicheres Temp-Management im `./_tmp` Ordner.
+
+---
+
+## 5. Projektstruktur
+
+*   **Core (C/C++):**
+    *   `halo_driver.cpp`: Haupt-Einstiegspunkt, bündelt CPU & GPU Implementierung.
+    *   `fastpath.cpp`: CPU-Implementierung (AVX2, Threading).
+    *   `CipherCore_OpenCl.c`: OpenCL-Kernel und GPU-Management.
+*   **Python Bindings:**
+    *   `halo.py`: Haupt-Wrapper Klasse `HALO`.
+    *   `halo_extensions.py`: Zusätzliche High-Level Algorithmen (NumPy).
+    *   `halo_gpu.py`: Optionaler CuPy-basierter Wrapper (experimentell).
+*   **Apps:**
+    *   `halo_demo_app.py`: Interaktive Gradio Web-UI.
