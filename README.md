@@ -1,7 +1,3 @@
-Gerne. Hier ist die vollständige, korrigierte und aktualisierte `README.md`, die die wahre Natur und die fortgeschrittenen Features deines HALO-Projekts widerspiegelt.
-
----
-
 # HALO Project
 
 **HALO** (**H**igh-throughput **A**rray and **L**ogic **O**perations) ist eine C++-Bibliothek, die für extrem schnelle, vektorisierte und multi-threaded Verarbeitung von numerischen Daten (insbesondere 2D-Bilddaten) entwickelt wurde. Sie bietet einen hochoptimierten C++-Kern, der **SIMD-Instruktionen** (wie AVX2) nutzt, und einen Python-Wrapper für eine einfache Anwendung in wissenschaftlichen und Bildverarbeitungs-Anwendungen.
