@@ -17,6 +17,9 @@
  * Includes loss shaping functionality based on a list of critical pairs.
  */
 
+#ifndef CIPHERCORE_OPENCL_INCLUDED
+#define CIPHERCORE_OPENCL_INCLUDED
+
 #define _CRT_SECURE_NO_WARNINGS /* For Visual Studio (if sprintf/sprintf_s is used) */
 #include <stdio.h>
 #include <stdlib.h>
@@ -4136,3 +4139,5 @@ DLLEXPORT unsigned int simulated_get_compute_unit_count(int gpu_index) {
 #ifdef __cplusplus
 }
 #endif
+
+#endif // CIPHERCORE_OPENCL_INCLUDED

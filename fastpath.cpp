@@ -1,4 +1,6 @@
 // fastpath.cpp (v0.5b) — HALO: SAXPY/Reduce + 2D-Image-Kern (LUT + AXPBY)
+#ifndef HALO_FASTPATH_INCLUDED
+#define HALO_FASTPATH_INCLUDED
 //  - Persistenter Thread-Pool (kein Thread-Spawn pro Call)
 //  - Auto-Scheduler: ST/MT & NT-Stores basierend auf Bytes/Breite/Alignment
 //  - Affine-LUT Fast-Path (kein Gather bei LUT[i]≈a*i+b)
@@ -2923,3 +2925,5 @@ HALO_API int halo_relu_clamp_axpby_f32(
 HALO_API void halo_shutdown_pool() {
   ThreadPool::instance().stop_all();
 }
+
+#endif // HALO_FASTPATH_INCLUDED
