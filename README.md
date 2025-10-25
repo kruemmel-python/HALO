@@ -91,5 +91,3 @@ Die Gradio-Demo-Anwendung (`halo_demo_app.py`) demonstriert alle Funktionen in e
 python halo_demo_app.py
 ```
 
----
-*(Ende des README.md)*
