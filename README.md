@@ -1,48 +1,47 @@
 # HALO Project
 
-**HALO** (**H**igh-throughput **A**rray and **L**ogic **O**perations) ist eine C++-Bibliothek, die für extrem schnelle, vektorisierte und multi-threaded Verarbeitung von numerischen Daten (insbesondere 2D-Bilddaten) entwickelt wurde. Sie bietet einen hochoptimierten C++-Kern, der **SIMD-Instruktionen** (wie AVX2) nutzt, und einen Python-Wrapper für eine einfache Anwendung in wissenschaftlichen und Bildverarbeitungs-Anwendungen.
+**HALO** (**H**igh-throughput **A**rray and **L**ogic **O**perations) ist eine hochoptimierte Softwarelösung für die rechenintensive numerische und Bilddatenverarbeitung. Das Projekt kombiniert einen performanten C++-Kern, der Hardware-Optimierungen wie SIMD (AVX2/FMA) und Multi-Threading nutzt, mit einem schlanken Python-Wrapper für eine nahtlose Anwendungsintegration.
 
-## Features
+*Version: 1.0 (2025-10-25)*
 
-Das Design von HALO basiert auf folgenden Säulen:
+## 2. Executive Summary
 
-*   **Aggressive C++ Optimierung:** Direkter Einsatz von x86 **SIMD-Instruktionen (AVX2)** und **FMA** für bis zu 8x schnelleren Single-Thread-Durchsatz im Vergleich zu Skalar-Code.
-*   **Dynamisches Multi-Threading:** Ein **persistenter Worker-Thread-Pool** eliminiert den Thread-Erzeugungs-Overhead. Ein **Auto-Scheduler** teilt die Arbeit basierend auf der Größe und Komplexität der Aufgabe intelligent auf die Kerne auf.
-*   **Speicherbandbreiten-Optimierung:** Unterstützt **Non-Temporal (Streaming) Stores** für speichergebundene Operationen (z.B. SAXPY) zur Umgehung der CPU-Cache-Hierarchie.
-*   **Erweiterte Bildverarbeitungs-Kernel (Float32):**
-    *   **Filter:** Box Blur, Gaussian Blur (separabel, vektorisiert), Sobel Kantenfilter (vektorisiert), Median ($3 \times 3$).
-    *   **Morphologie:** Erode, Dilate, Open, Close ($3 \times 3$, separabel).
-    *   **Geometrie:** Bilineares und Bikubisches Resizing (**AVX2-Gather**-optimiert), Flip, Rotate90.
-    *   **Tonwert:** Levels, Gamma-Korrektur, Invertierung, Threshold, Unsharp Masking.
-*   **Pythonic Bridge:** Ein schlanker Python-Wrapper (`halo.py`) mit `ctypes` und Hilfsfunktionen zur Erstellung **aligned/pinned memory** für maximalen Performance-Gewinn.
-*   **Visualisierungs-Utilities:** Eingebettete Vektorgrafik- und Plot-Logik (z.B. `VectorCanvas`) zur direkten Darstellung von Ergebnissen ohne externe Plot-Bibliotheken.
+HALO wurde entwickelt, um die Performance-Grenzen typischer Python-basierter Bibliotheken bei der Verarbeitung großer Array-Daten zu überwinden. Der Kern fokusiert auf **aggressive, hardwarenahe Optimierungen** wie die direkte Nutzung von **AVX2-SIMD**-Instruktionen und einem **intelligenten Multi-Threading-Modell** (persistenter Thread-Pool mit Auto-Scheduler).
 
-## Kompilierungsanweisungen (C++ Driver)
+HALO richtet sich an Ingenieure, Datenwissenschaftler und Forscher in Bereichen wie **Bildverarbeitung, Computer Vision** und **wissenschaftliche Simulationen**, die eine beispiellose Geschwindigkeit und Speichereffizienz bei pixelweisen Operationen, Filtern oder geometrischen Transformationen benötigen.
 
-Der C++-Treiber muss aus der Datei `fastpath.cpp` kompiliert werden.
+## 3. Kern-Features und Optimierungen
 
-**WICHTIG:** Die kompilierte Shared Library (*.dll* oder *.so*) muss sich **im selben Ordner wie die Python-Datei `halo.py`** befinden.
+| Kategorie | Merkmale | Hardware-Optimierungen |
+| :--- | :--- | :--- |
+| **Performance-Kern** | C++ Shared Library (`fastpath.cpp`) für maximale Ausführungsgeschwindigkeit. | Direkter Einsatz von **AVX2/FMA** SIMD-Instruktionen. |
+| **Multi-Threading**| **Persistenter Thread-Pool** eliminiert Erzeugungs-Overhead. | **Dynamischer Auto-Scheduler** für optimale Lastverteilung (geringere Latenz). |
+| **Speicher-I/O** | Spezielle Algorithmen für speichergebundene Operationen (z.B. SAXPY). | **Non-Temporal (Streaming) Stores** reduzieren Cache-Druck. |
+| **Funktionalität** | Breite Palette an Kernels: Blur, Sobel, Median, Erode/Dilate, Levels, Gamma, Invert, Resize (Bilinear/Bicubic mit AVX2-Gather). | Python-Wrapper unterstützt **Aligned/Pinned Memory** für Zero-Copy-Datenübergabe. |
 
-### 1. Unter MinGW/GCC (Windows / Linux)
+## 4. Kompilierungsanweisungen (C++ Driver)
 
-Verwenden Sie die bewährte Kommando-Struktur, um die beste Kompatibilität und Leistung zu gewährleisten. Das Flag **`-pthread`** ist für die Thread-Funktionalität erforderlich.
+Die C++-Bibliothek muss kompiliert werden, um die Hardware-spezifischen Optimierungen zu nutzen.
+
+**WICHTIG:** Die kompilierte Shared Library (`halo_fastpath.dll` oder `libhalo_fastpath.so`) muss sich **im selben Ordner wie die Python-Datei `halo.py`** befinden.
+
+### 4.1. Unter MinGW/GCC (Windows / Linux)
+
+Verwenden Sie das bewährte Kommando, das die Optimierungs-, Architektur- und Thread-Flags in die korrekte Reihenfolge bringt:
 
 ```bash
-# Für Windows (DLL):
+# Für Windows (DLL) oder Linux (SO)
 g++ -O3 -march=native -pthread -shared -o halo_fastpath.dll fastpath.cpp
-
-# Für Linux/macOS (SO):
-g++ -O3 -march=native -pthread -shared -o libhalo_fastpath.so fastpath.cpp
+# Für Linux/macOS verwenden Sie: -o libhalo_fastpath.so
 ```
 
-| Flag | Bedeutung |
+| Flag | Zweck |
 | :--- | :--- |
 | `-O3` | Aggressive Compiler-Optimierung. |
-| `-march=native`| Erzeugt Code für die native CPU-Architektur (wichtig für AVX2/FMA). |
+| `-march=native`| Optimiert für die CPU, auf der kompiliert wird (AVX2/FMA). |
 | `-pthread` | Bindet die POSIX Threads Library ein (für `std::thread`). |
-| `-shared` | Erstellt eine Shared Library (DLL/SO). |
 
-### 2. Unter MSVC (Microsoft Visual C++)
+### 4.2. Unter MSVC (Microsoft Visual C++)
 
 Verwenden Sie den *x64 Native Tools Command Prompt* oder den *Developer Command Prompt*.
 
@@ -50,45 +49,26 @@ Verwenden Sie den *x64 Native Tools Command Prompt* oder den *Developer Command 
 cl /LD /EHsc /O2 /arch:AVX2 /std:c++17 fastpath.cpp /Fe:halo_fastpath.dll
 ```
 
-| Flag | Bedeutung |
-| :--- | :--- |
-| `/LD` | Erstellt eine DLL. |
-| `/O2` | Optimierungslevel 2 (Geschwindigkeit). |
-| `/arch:AVX2`| Aktiviert AVX2 SIMD-Instruktionen. |
-| `/std:c++17`| Verwendet den C++17-Standard. |
+## 5. Python Wrapper Nutzung
 
-## Python Wrapper Nutzung
+### 5.1. Setup und Beispiel
 
-### 1. Installation und Setup
-
-1.  **Stellen Sie die HALO-Dateien bereit:**
-    Platzieren Sie `halo.py` und die kompilierte Library (`*.dll` oder `*.so`) im selben Python-Quellverzeichnis.
-
-2.  **Installieren Sie Python-Abhängigkeiten:**
-    ```bash
-    pip install numpy gradio
-    ```
-
-### 2. Grundlegendes Anwendungsbeispiel
-
-Der Zugriff auf alle optimierten Funktionen erfolgt über die Hauptklasse `HALO`.
+1.  **Installieren Sie Python-Abhängigkeiten:** `pip install numpy gradio`
+2.  **Verwenden Sie die HALO-Klasse:**
 
 ```python
 import numpy as np
 from halo import HALO, make_aligned_f32_buffer 
-import math # Für Sigma-Berechnung
 
-# 1. Initialisiere HALO (startet den Thread-Pool und führt Autotuning durch)
+# 1. Initialisiere HALO (Thread-Pool-Start und Autotuning)
 halo = HALO(threads=4)
 
-# 2. Vorbereitung der Puffer (1920x1080)
+# 2. Erstellung Aligned Memory Puffer (Wichtig für AVX2/Streaming!)
 W, H = 1920, 1080
-
-# Erstellt einen aligned memoryview ('f') und den Stride in Bytes
 src_mv, src_stride = make_aligned_f32_buffer(W, H, components=1) 
 dst_mv, dst_stride = make_aligned_f32_buffer(W, H, components=1)
 
-# Fülle den Puffer mit Beispieldaten (z.B. aus einem NumPy Array)
+# Daten füllen... (z.B. aus NumPy)
 src_mv[:] = np.random.rand(W*H).astype(np.float32)
 
 # 3. Aufruf eines optimierten Kernels (Gaussian Blur)
@@ -100,13 +80,16 @@ halo.gaussian_blur_f32(
     sigma=sigma, use_mt=True
 )
 
-print(f"Gaussian Blur (Sigma={sigma}) erfolgreich ausgeführt.")
+print(f"HALO-Kernel erfolgreich ausgeführt. Thread-Pool-Status: {halo.profile.get('cfg', {}).get('threads')} Threads.")
 ```
 
-### 3. Interaktive Gradio-Demo (Web-App)
+### 5.2. Interaktive Demo
 
-Führen Sie das Gradio-Demo-Skript aus, um alle HALO-Funktionen interaktiv zu testen:
+Die Gradio-Demo-Anwendung (`halo_demo_app.py`) demonstriert alle Funktionen in einer interaktiven Web-App:
 
 ```bash
 python halo_demo_app.py
 ```
+
+---
+*(Ende des README.md)*
