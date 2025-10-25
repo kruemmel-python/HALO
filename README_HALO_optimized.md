@@ -121,12 +121,6 @@ python halo_demo_app.py
 
 ## 📸 Screenshots & GUI-Vorschau
 
-| CPU Fast-Path (AVX2) | GPU OpenCL Hybrid |
-|:---------------------:|:----------------:|
-| ![CPU Fast-Path](docs/images/cpu_fastpath.png) | ![GPU Hybrid](docs/images/gpu_hybrid.png) |
-
-> Screenshots liegen unter `docs/images/`  
-> Du kannst sie aus der Demo-App exportieren oder eigene Benchmarks dort ablegen.
 
 ---
 
