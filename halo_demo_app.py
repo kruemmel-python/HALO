@@ -2,7 +2,7 @@ import gradio as gr
 import numpy as np
 import math
 import ctypes as C
-from typing import Optional, Tuple, List, Union, Any
+from typing import Optional, Tuple, List, Union, Any, Literal
 from array import array
 import os
 from pathlib import Path
@@ -10,64 +10,86 @@ import platform
 import json
 
 # ====================================================================
-# ABSCHNITT 1: HALO-Klassen & ctypes-Adapter (Auszug aus halo.py)
-# WICHTIG: Ersetzt durch dein vollständiges halo.py Modul.
+# ABSCHNITT 1: HALO-Klassen, Konvertierungs-Hilfsmittel und Imports
 # ====================================================================
 
-# Typdefinitionen aus halo.py
+# Typdefinitionen
 ArrayLikeFloat = Union[array, memoryview]
 ArrayLikeU8    = Union[bytes, bytearray, memoryview]
 HALO_Buffer = ArrayLikeFloat # Für die interne Verarbeitung
 
-# Hier wird der Code deines halo.py Moduls implizit angenommen. 
-# WICHTIG: Stelle sicher, dass die echte halo.py und die DLL/SO im Pfad sind.
-
 try:
     from halo import HALO, make_aligned_f32_buffer
+    from halo_extensions import (
+        bilateral_filter, canny_edge_detector, convert_colorspace, 
+        morphological_operation as hl_morph_op, warp_affine, AffineTransform
+    )
     
-    # Init-Logik zur Lasterkennung
-    if 'HALO_Buffer' not in locals():
-        HALO_Buffer = ArrayLikeFloat
-    
-    # Dummy-Funktion zur Umgehung der C-Pointer-Komplexität in den Wrappern
     def _to_c_f32_ptr_2d(buf: HALO_Buffer, *args, **kwargs) -> HALO_Buffer:
-        # Im Gradio-Kontext (wenn NumPy-Array zu MemoryView konvertiert)
-        # wird einfach das memoryview-Objekt selbst zurückgegeben.
         return buf
 
     halo_instance = HALO(threads=4)
     print(f"HALO-Bibliothek ({halo_instance.features}) erfolgreich geladen.")
     
-except ImportError:
-    print("FEHLER: Konnte HALO-Modul nicht importieren. Erzeuge Dummy-Klasse.")
+except ImportError as e:
+    print(f"FEHLER: HALO-Import fehlgeschlagen. Einige Funktionen sind deaktiviert. {e}")
     class DummyHALO:
         def __init__(self): pass
-        def __getattr__(self, name):
-            if name.startswith('resize'):
-                return lambda src, w, h, ss, dst, dw, dh, ds, use_mt: 0
-            if name.endswith('f32'):
-                return lambda src, dst=None, w=0, h=0, ss=0, ds=0, *args, **kwargs: 0
-            return lambda *args, **kwargs: None
+        def __getattr__(self, name): return lambda *args, **kwargs: 0
+    class DummyExtensions:
+        def __getattr__(self, name): 
+            return lambda *args, **kwargs: np.zeros((100, 100, 3), dtype=np.uint8)
     halo_instance = DummyHALO()
+    hl_morph_op = bilateral_filter = canny_edge_detector = convert_colorspace = warp_affine = DummyExtensions().dummy
+    AffineTransform = object()
+    make_aligned_f32_buffer = lambda *args, **kwargs: (memoryview(bytearray(1)), 4)
+
+
+# --- HALO-Bridge Logik ---
+
+def _get_dtype_info(img: np.ndarray) -> Tuple[np.dtype, float, float]:
+    """Extrahiert ursprünglichen Dtype und Skalierungsfaktoren für die Rückkonvertierung."""
+    if np.issubdtype(img.dtype, np.floating):
+        return img.dtype, 1.0, 0.0
+    if img.dtype == np.uint8:
+        scale = 255.0
+    elif img.dtype == np.uint16:
+        scale = 65535.0
+    else:
+        raise TypeError(f"Unsupported dtype: {img.dtype}")
+    return img.dtype, scale, 0.0
+
+def _normalize_to_float32(img: np.ndarray, dtype_info: Tuple[np.dtype, float, float]) -> np.ndarray:
+    """Konvertiert Array zu float32 (0.0-1.0), behält aber ursprünglichen Dtype bei."""
+    dtype, scale, _ = dtype_info
+    if np.issubdtype(dtype, np.floating):
+        return img.astype(np.float32)
+    return img.astype(np.float32) / scale
+
+def _denormalize_from_float32(img_f32: np.ndarray, dtype_info: Tuple[np.dtype, float, float]) -> np.ndarray:
+    """Konvertiert Array von float32 (0.0-1.0) zurück zu ursprünglichem Dtype."""
+    dtype, scale, _ = dtype_info
+    if np.issubdtype(dtype, np.floating):
+        return img_f32.astype(dtype, copy=False)
     
-# --- Ende des HALO-Wrapper-Abschnitts ---
+    max_val = scale
+    img_scaled = np.clip(img_f32 * scale, 0, max_val)
+    return img_scaled.astype(dtype, copy=False)
 
 
-# ====================================================================
-# ABSCHNITT 2: Gradio-Bridge und Konvertierungslogik (KORRIGIERT)
-# ====================================================================
-
-def _convert_image_to_float_channels(img: np.ndarray) -> List[Tuple[HALO_Buffer, int]]:
-    """Konvertiert HxWxC uint8-Bild in eine Liste von (Channel-Buffer, Stride) float32-Arrays (0.0-1.0)."""
+def _convert_image_to_float_channels(img: np.ndarray) -> List[Tuple[HALO_Buffer, int, Tuple[int, int]]]:
+    """Konvertiert NumPy-Bild zu HALO-Buffern."""
     if img is None: return []
     
-    if len(img.shape) == 2:
-        img = np.stack([img, img, img], axis=-1)
-    elif img.shape[2] == 4:
-        img = img[:, :, :3]
-
-    h, w, c = img.shape
-    img_f32 = img.astype(np.float32) / 255.0
+    dtype_info = _get_dtype_info(img)
+    img_f32 = _normalize_to_float32(img, dtype_info)
+    
+    h, w = img_f32.shape[:2]
+    c = img_f32.shape[2] if img_f32.ndim == 3 else 1
+    
+    if img_f32.ndim == 2:
+        img_f32 = img_f32[..., None]
+        
     channels = np.split(img_f32, c, axis=2)
     
     halo_buffers = []
@@ -75,31 +97,32 @@ def _convert_image_to_float_channels(img: np.ndarray) -> List[Tuple[HALO_Buffer,
         buf_mv, stride_bytes = make_aligned_f32_buffer(w, h, components=1, alignment=64)
         flat_data = channels[i].flatten()
         buf_mv[:w*h] = flat_data
-        halo_buffers.append((buf_mv, stride_bytes))
+        halo_buffers.append((buf_mv, stride_bytes, (w, h)))
 
     return halo_buffers
 
-def _convert_float_channels_to_image(channels_info: List[Tuple[HALO_Buffer, int]], h: int, w: int) -> np.ndarray:
-    """Konvertiert Liste von (Channel-Buffer, Stride) float32-Arrays zurück in HxWxC uint8-Bild."""
-    if not channels_info:
-        # Wenn wir die Höhe/Breite nicht kennen, Fallback auf Standard
-        return np.zeros((512, 512, 3), dtype=np.uint8) if h == 0 or w == 0 else np.zeros((h, w, 3), dtype=np.uint8)
+def _convert_float_channels_to_image(channels_info: List[Tuple[HALO_Buffer, int, Tuple[int, int]]], original_dtype_info: Tuple[np.dtype, float, float]) -> np.ndarray:
+    """Konvertiert HALO-Buffer zurück zu NumPy-Bild."""
+    if not channels_info: return np.zeros((100, 100, 3), dtype=np.uint8)
 
-    output_channels = []
-    # Die tatsächliche Höhe/Breite ergibt sich aus dem ersten Puffer und dessen Dimensionierung
-    w_out = w
-    h_out = h
+    w_out, h_out = channels_info[0][2]
     
-    for buf, stride_bytes in channels_info:
-        # Wir nehmen die Dimensionen des Buffers, da sie sich durch z.B. Rotation geändert haben können.
+    output_channels = []
+    
+    for buf, stride_bytes, _ in channels_info:
         flat_data = np.array(buf[:w_out*h_out], dtype=np.float32)
-        channel_f32 = np.clip(np.reshape(flat_data, (h_out, w_out, 1)), 0.0, 1.0)
+        channel_f32 = np.reshape(flat_data, (h_out, w_out, 1))
         output_channels.append(channel_f32)
 
     img_f32 = np.concatenate(output_channels, axis=2)
-    img_uint8 = (img_f32 * 255.0).astype(np.uint8)
-    return img_uint8
-
+    
+    img_final = _denormalize_from_float32(img_f32.squeeze(), original_dtype_info)
+    
+    if img_final.ndim == 2:
+        if not np.issubdtype(original_dtype_info[0], np.floating):
+            return np.stack([img_final] * 3, axis=-1)
+    
+    return img_final
 
 def apply_halo_filter_per_channel(
     img: np.ndarray,
@@ -110,7 +133,8 @@ def apply_halo_filter_per_channel(
     if img is None: return None
 
     h, w = img.shape[:2]
-    c = img.shape[2] if len(img.shape) == 3 else 1
+    c = img.shape[2] if img.ndim == 3 else 1
+    dtype_info = _get_dtype_info(img)
     
     input_buffers_info = _convert_image_to_float_channels(img)
     if not input_buffers_info: return img
@@ -120,11 +144,11 @@ def apply_halo_filter_per_channel(
     output_buffers_info = []
     for i in range(c):
         out_buf_mv, out_stride_bytes = make_aligned_f32_buffer(out_w, out_h, components=1, alignment=64)
-        output_buffers_info.append((out_buf_mv, out_stride_bytes))
+        output_buffers_info.append((out_buf_mv, out_stride_bytes, (out_w, out_h)))
 
     for i in range(c):
-        src_buf, src_stride = input_buffers_info[i]
-        dst_buf, dst_stride = output_buffers_info[i]
+        src_buf, src_stride, _ = input_buffers_info[i]
+        dst_buf, dst_stride, _ = output_buffers_info[i]
 
         try:
             halo_fn_wrapper(
@@ -135,12 +159,12 @@ def apply_halo_filter_per_channel(
              print(f"HALO Laufzeitfehler im Kanal {i}: {e}")
              return img 
 
-    return _convert_float_channels_to_image(output_buffers_info, out_h, out_w)
+    return _convert_float_channels_to_image(output_buffers_info, dtype_info)
 
 
-# --- Spezifische HALO-Funktionen (mit Korrigierter Argumentübergabe) ---
-
-# --- Blur/Filter ---
+# ---------------------------------------------------------------------------
+# ABSCHNITT 3: Gradio Wrapper für Low-Level C++-Funktionen (Definiert)
+# ---------------------------------------------------------------------------
 
 def process_blur_box(img: np.ndarray, radius: int) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
@@ -149,7 +173,6 @@ def process_blur_box(img: np.ndarray, radius: int) -> np.ndarray:
 
 def process_blur_gaussian(img: np.ndarray, sigma: float) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
-        # Korrigiert: sigma ist Positional
         halo_instance.gaussian_blur_f32(src, dst_buf, src_w, src_h, ss, dst_stride, sigma, use_mt=True)
     return apply_halo_filter_per_channel(img, wrapper)
 
@@ -213,10 +236,7 @@ def process_tonewheel_threshold(img: np.ndarray, low: float, high: float) -> np.
         )
     return apply_halo_filter_per_channel(img, wrapper)
 
-# --- Morphologie ---
 def process_morphology(img: np.ndarray, operation: str) -> np.ndarray:
-    if img is None: return None
-    
     if operation == "Erode": halo_fn = halo_instance.erode3x3_f32
     elif operation == "Dilate": halo_fn = halo_instance.dilate3x3_f32
     elif operation == "Open": halo_fn = halo_instance.open3x3_f32
@@ -229,8 +249,6 @@ def process_morphology(img: np.ndarray, operation: str) -> np.ndarray:
         halo_fn(src, dst_buf, src_w, src_h, ss, dst_stride, use_mt=True)
         
     return apply_halo_filter_per_channel(img, morph_wrapper)
-
-# --- Geometrie ---
 
 def process_geometry_flip(img: np.ndarray, horizontal: bool, vertical: bool) -> np.ndarray:
     def wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
@@ -264,27 +282,22 @@ def process_geometry_resize(img: np.ndarray, target_w: int, target_h: int, inter
     if halo_fn is None: return img
     
     def resize_wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, dst_w, dst_h, **kwargs):
-        # Resize-Signatur (src, src_w, src_h, ss, dst, dst_w, dst_h, ds, use_mt)
         halo_fn(src, src_w, src_h, ss, dst_buf, dst_w, dst_h, dst_stride, use_mt=True)
 
     return apply_halo_filter_per_channel(img, resize_wrapper, resize_target=(target_w, target_h))
 
-# --- Custom: AXPBY ---
-
 def process_custom_axpby(img: np.ndarray, alpha: float, beta: float, clamp_min: float, clamp_max: float, apply_relu: bool) -> np.ndarray:
-    """Implementiert dst = alpha * dst_orig + beta * src_orig."""
     if halo_instance.relu_clamp_axpby_f32 is None: return img
     h, w = img.shape[:2]
-    c = img.shape[2] if len(img.shape) == 3 else 1
+    c = img.shape[2] if img.ndim == 3 else 1
     
+    dtype_info = _get_dtype_info(img)
     input_buffers_info = _convert_image_to_float_channels(img)
-    if not input_buffers_info: return img
-
     output_buffers_info = []
     for i in range(c):
         out_buf_mv, out_stride_bytes = make_aligned_f32_buffer(w, h, components=1, alignment=64)
         out_buf_mv[:w*h] = input_buffers_info[i][0][:w*h] 
-        output_buffers_info.append((out_buf_mv, out_stride_bytes))
+        output_buffers_info.append((out_buf_mv, out_stride_bytes, (w, h)))
 
     def axpby_wrapper(src, ss, src_w, src_h, dst_buf, dst_stride, **kwargs):
         halo_instance.relu_clamp_axpby_f32(
@@ -294,8 +307,8 @@ def process_custom_axpby(img: np.ndarray, alpha: float, beta: float, clamp_min: 
         )
 
     for i in range(c):
-        src_buf, src_stride = input_buffers_info[i]
-        dst_buf, dst_stride = output_buffers_info[i]
+        src_buf, src_stride, _ = input_buffers_info[i]
+        dst_buf, dst_stride, _ = output_buffers_info[i]
 
         try:
             axpby_wrapper(src_buf, src_stride, w, h, dst_buf, dst_stride)
@@ -303,31 +316,75 @@ def process_custom_axpby(img: np.ndarray, alpha: float, beta: float, clamp_min: 
             print(f"HALO Laufzeitfehler in relu_clamp_axpby_f32: {e}")
             return img
     
-    return _convert_float_channels_to_image(output_buffers_info, h, w)
+    return _convert_float_channels_to_image(output_buffers_info, dtype_info)
+
+
+# ---------------------------------------------------------------------------
+# ABSCHNITT 4: Gradio Wrapper für High-Level Extensions (Neu definiert)
+# ---------------------------------------------------------------------------
+
+def apply_high_level_filter(img: np.ndarray, hl_fn: callable, *args, **kwargs) -> np.ndarray:
+    """Vereinfachter Wrapper für High-Level-Funktionen (NumPy in/out)."""
+    if img is None: return None
+    
+    dtype_info = _get_dtype_info(img)
+    # Normierung ist notwendig, da die Extensions intern mit float(0-1) arbeiten
+    img_hl_input = _normalize_to_float32(img, dtype_info) 
+    
+    try:
+        # Die High-Level-Funktion wird direkt auf dem normalisierten NumPy-Array ausgeführt
+        result_f32 = hl_fn(img_hl_input, *args, **kwargs)
+        
+        return _denormalize_from_float32(result_f32, dtype_info)
+    except Exception as e:
+        print(f"High-Level-Fehler in {hl_fn.__name__}: {e}")
+        return img 
+
+
+# --- High-Level Filter ---
+
+def process_hl_bilateral(img: np.ndarray, diameter: int, sigma_color: float, sigma_space: float) -> np.ndarray:
+    return apply_high_level_filter(img, bilateral_filter, diameter=diameter, sigma_color=sigma_color, sigma_space=sigma_space)
+
+def process_hl_canny(img: np.ndarray, low_threshold: float, high_threshold: float, sigma: float) -> np.ndarray:
+    return apply_high_level_filter(img, canny_edge_detector, low_threshold=low_threshold, high_threshold=high_threshold, gaussian_sigma=sigma)
+
+def process_hl_morphology(img: np.ndarray, operation: str) -> np.ndarray:
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    return apply_high_level_filter(img, hl_morph_op, operation=operation, kernel=kernel)
+
+# --- Farbraum und Geometrie ---
+
+def process_hl_colorspace(img: np.ndarray, src: str, dst: str) -> np.ndarray:
+    return apply_high_level_filter(img, convert_colorspace, src=src, dst=dst)
+
+def process_hl_warp_affine(img: np.ndarray, tx: float, ty: float, rot: float, scale: float) -> np.ndarray:
+    if AffineTransform is object: return img
+    transform = AffineTransform.from_components(translation=(tx, ty), rotation_deg=rot, scale=(scale, scale))
+    return apply_high_level_filter(img, warp_affine, matrix=transform.matrix)
 
 
 # ====================================================================
-# ABSCHNITT 3: Gradio UI Definition
+# ABSCHNITT 5: Gradio UI Definition
 # ====================================================================
 
 with gr.Blocks(title="HALO Image Processor Demo") as demo:
     gr.Markdown(
         """
-        # HALO High-Performance Image Processor (Demo)
-        Demonstriert die Nutzung der hochoptimierten HALO-Bibliothek (C++ mit AVX2/MT) 
-        innerhalb einer Gradio-Web-App. **Alle Filter werden pro Kanal (R/G/B) auf float32-Daten angewendet.**
+        # HALO Image Processor Demo (CPU-Optimiert + High-Level Extensions)
         """
     )
     
     with gr.Row():
-        image_input = gr.Image(label="Eingabebild", type="numpy", interactive=True)
-        image_output = gr.Image(label="Ergebnisbild (HALO)", type="numpy")
+        image_input = gr.Image(label="Eingabebild (uint8/uint16/float)", type="numpy", interactive=True)
+        image_output = gr.Image(label="Ergebnisbild", type="numpy")
 
     gr.Markdown("---")
     
     with gr.Tabs():
         
-        with gr.TabItem("Weichzeichner / Filter"):
+        # --- C++-Optimierte Filter ---
+        with gr.TabItem("C++ Filter (AVX2/MT)"):
             with gr.Column():
                 gr.Markdown("### Faltungs- und Medianfilter")
                 
@@ -356,7 +413,56 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
                 btn_median.click(process_filter_median, inputs=[image_input], outputs=image_output)
                 btn_unsharp.click(process_filter_unsharp, inputs=[image_input, sigma_unsharp, amount_unsharp, threshold_unsharp], outputs=image_output)
 
-        with gr.TabItem("Tonwert / Farbe"):
+        
+        # --- High-Level Extensions (NEU) ---
+
+        with gr.TabItem("High-Level Filter (Python/NumPy)"):
+            gr.Markdown("### Fortgeschrittene Filter & Erweiterte Morphologie")
+            
+            with gr.Row():
+                gr.Markdown("#### Bilateral Filter (Kanten-erhaltende Glättung)")
+                bilat_diam = gr.Slider(label="Diameter", minimum=3, maximum=21, step=2, value=5)
+                bilat_sigma_c = gr.Slider(label="Sigma Color", minimum=0.01, maximum=0.5, step=0.01, value=0.1)
+                bilat_sigma_s = gr.Slider(label="Sigma Space", minimum=0.5, maximum=10.0, step=0.5, value=2.0)
+                btn_bilat = gr.Button("Bilateral Filter Anwenden")
+                btn_bilat.click(process_hl_bilateral, inputs=[image_input, bilat_diam, bilat_sigma_c, bilat_sigma_s], outputs=image_output)
+
+            with gr.Row():
+                gr.Markdown("#### Canny Edge Detector")
+                canny_low = gr.Slider(label="Low Threshold", minimum=0.01, maximum=0.5, step=0.01, value=0.1)
+                canny_high = gr.Slider(label="High Threshold", minimum=0.1, maximum=0.9, step=0.01, value=0.3)
+                canny_sigma = gr.Slider(label="Gaussian Sigma", minimum=0.5, maximum=3.0, step=0.1, value=1.4)
+                btn_canny = gr.Button("Canny Edge Detector Anwenden")
+                btn_canny.click(process_hl_canny, inputs=[image_input, canny_low, canny_high, canny_sigma], outputs=image_output)
+
+            with gr.Row():
+                gr.Markdown("#### Erweiterte Morphologie")
+                hl_morph_op_type = gr.Radio(label="Operation", choices=["gradient", "tophat", "blackhat", "hitmiss"], value="gradient")
+                btn_hl_morph = gr.Button("Morphologische Operation Anwenden (3x3)")
+                btn_hl_morph.click(process_hl_morphology, inputs=[image_input, hl_morph_op_type], outputs=image_output)
+
+
+        with gr.TabItem("Farbraum & Warping"):
+            gr.Markdown("### Farbraum-Konvertierungen und Geometrie")
+            
+            with gr.Row():
+                cs_src = gr.Radio(label="Quell-Farbraum", choices=["rgb", "hsv", "ycbcr"], value="rgb", type="value")
+                cs_dst = gr.Radio(label="Ziel-Farbraum", choices=["rgb", "gray", "hsv", "ycbcr"], value="hsv", type="value")
+                btn_cs = gr.Button("Farbraum Konvertieren")
+                btn_cs.click(process_hl_colorspace, inputs=[image_input, cs_src, cs_dst], outputs=image_output)
+            
+            with gr.Row():
+                gr.Markdown("#### Affine Warping")
+                warp_tx = gr.Slider(label="Trans. X (Pixel)", minimum=-50, maximum=50, step=1, value=0)
+                warp_ty = gr.Slider(label="Trans. Y (Pixel)", minimum=-50, maximum=50, step=1, value=0)
+                warp_rot = gr.Slider(label="Rotation (°)", minimum=-180, maximum=180, step=1, value=0)
+                warp_scale = gr.Slider(label="Skalierung", minimum=0.5, maximum=2.0, step=0.1, value=1.0)
+                btn_warp = gr.Button("Affine Warp Anwenden")
+                btn_warp.click(process_hl_warp_affine, inputs=[image_input, warp_tx, warp_ty, warp_rot, warp_scale], outputs=image_output)
+                
+
+        # --- C++ Tonwert ---
+        with gr.TabItem("C++ Tonwert"):
             gr.Markdown("### Helligkeits- und Farbraumkorrekturen (Float-Bereich 0-1)")
             
             with gr.Row():
@@ -381,8 +487,10 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
                 threshold_high = gr.Slider(label="Threshold High (0-1)", minimum=0.0, maximum=1.0, step=0.01, value=0.6)
                 btn_threshold = gr.Button("Threshold Anwenden")
                 btn_threshold.click(process_tonewheel_threshold, inputs=[image_input, threshold_low, threshold_high], outputs=image_output)
+        
 
-        with gr.TabItem("Morphologie"):
+        # --- C++ Morphologie ---
+        with gr.TabItem("C++ Morphologie"):
             gr.Markdown("### Morphologische 3x3 Operationen (Zwei-Pass Separabel)")
             
             with gr.Row():
@@ -396,9 +504,10 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
             btn_dilate.click(process_morphology, inputs=[image_input, gr.State("Dilate")], outputs=image_output)
             btn_open.click(process_morphology, inputs=[image_input, gr.State("Open")], outputs=image_output)
             btn_close.click(process_morphology, inputs=[image_input, gr.State("Close")], outputs=image_output)
+            
 
-
-        with gr.TabItem("Geometrie"):
+        # --- C++ Geometrie ---
+        with gr.TabItem("C++ Geometrie"):
             gr.Markdown("### Geometrische Operationen")
             
             with gr.Row():
@@ -408,7 +517,6 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
                 btn_flip.click(process_geometry_flip, inputs=[image_input, flip_h, flip_v], outputs=image_output)
                 
             with gr.Row():
-                # Ändere zu Dropdown, da Radio mit int-Values manchmal Probleme macht
                 rotate_turns = gr.Radio(label="90° Drehungen", choices=[1, 2, 3], value=1, type="value")
                 btn_rotate = gr.Button("Drehen um 90°/180°/270°")
                 btn_rotate.click(process_geometry_rotate, inputs=[image_input, rotate_turns], outputs=image_output)
@@ -420,12 +528,11 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
                 btn_resize = gr.Button("Bildgröße ändern")
                 btn_resize.click(process_geometry_resize, inputs=[image_input, resize_w, resize_h, resize_interp], outputs=image_output)
 
-
-        with gr.TabItem("Custom: AXPBY + ReLU/Clamp"):
+        # --- C++ AXPBY ---
+        with gr.TabItem("C++ AXPBY/ReLU/Clamp"):
             gr.Markdown(
                 """
                 ### Erweiterte AXPBY-Operation (`dst = alpha * dst_orig + beta * src_orig`)
-                Da Gradio nur ein Bild zulässt, wird das Eingabebild als `src_orig` und `dst_orig` verwendet.
                 """
             )
             
@@ -442,6 +549,7 @@ with gr.Blocks(title="HALO Image Processor Demo") as demo:
             btn_axpby.click(process_custom_axpby, 
                              inputs=[image_input, alpha_val, beta_val, clamp_min_val, clamp_max_val, apply_relu_check], 
                              outputs=image_output)
+
 
 # Starte die Gradio App
 if __name__ == "__main__":
