@@ -424,6 +424,14 @@ def process_hl_warp_affine(img: np.ndarray, tx: float, ty: float, rot: float, sc
 # ABSCHNITT 4b: Gesichtsanimation (Landmarks → maskierte Warp-Deformation)
 # ---------------------------------------------------------------------------
 
+# --- Gesichtsanimation: Tuning-Defaults ---
+FORCE_OCV_REMAP = True      # immer OpenCV-Remap (Pixelkoordinaten) verwenden
+EYE_STRENGTH_BASE   = 1.8   # stärkeres Blinzeln
+MOUTH_STRENGTH_BASE = 1.5   # kräftigere Mundöffnung
+TARGET_EYE_PIX      = 28.0  # kleinere Augen -> stärkere Verstärkung
+TARGET_MOUTH_PIX    = 44.0  # kleinere Lippen -> stärkere Verstärkung
+FALLOFF_EXPONENT    = 4.0   # härteres Auslaufen der Maske (3..5 sinnvoll)
+
 def _nz(value, default):
     """None-safe: gibt default zurück, falls value None ist."""
     return default if value is None else value
@@ -483,7 +491,7 @@ def _build_region_info(H:int, W:int, name:str, poly_xy_int: np.ndarray) -> Regio
     # Falloff = DistanceTransform innen (1 in der Mitte → 0 zum Rand)
     dist_in = cv2.distanceTransform((mask==255).astype(np.uint8), cv2.DIST_L2, 3)
     max_in = float(dist_in.max()) if dist_in.size else 1.0
-    fall = (dist_in/(max_in+1e-6)).astype(np.float32) ** 3.0
+    fall = (dist_in/(max_in+1e-6)).astype(np.float32) ** FALLOFF_EXPONENT
     return RegionInfo(name, poly_xy_int, (cx,cy), mask, fall)
 
 def _preview_overlay(img: np.ndarray, polys: Dict[str,np.ndarray]) -> np.ndarray:
@@ -560,17 +568,15 @@ def process_face_anim_frame(
     polys_state: dict | None = None
 ) -> np.ndarray:
     """
-    Einzel-Frame-Render mit echten Landmark-Regionen (Augen & Lippen).
+    Einzel-Frame-Render mit Landmark-Regionen (Augen & Lippen).
     - None-sicher: Slider-Defaults werden koalesziert.
-    - Sichtbarer Warp: pro Region automatisch verstärkt (größe-abhängig).
-    - Robustes Remap: bevorzugt HALO warp_custom, sonst OpenCV-Remap.
+    - Adaptive Verstärkung nach Regionsgröße.
+    - Remap garantiert per OpenCV (Pixelkoordinaten).
     """
     if img is None:
         return None
 
-    # ---- 0) kleine Hilfsfunktionen -------------------------------------------------
     def _region_bbox(poly: np.ndarray) -> tuple[int,int,int,int]:
-        """(x0,y0,x1,y1) Bounding Box einer Polygon-Region; robust bei leeren polys."""
         if poly is None or len(poly) < 3:
             return 0, 0, img.shape[1]-1, img.shape[0]-1
         x0 = int(np.clip(np.min(poly[:,0]), 0, img.shape[1]-1))
@@ -581,81 +587,63 @@ def process_face_anim_frame(
         if y1 <= y0: y1 = min(y0+1, img.shape[0]-1)
         return x0, y0, x1, y1
 
-    # Falls du _remap_bilinear noch nicht hast, nimm die vorhandene Fassung aus meiner letzten Antwort.
-    # def _remap_bilinear(img_f32, map_x, map_y): ...
-
     try:
-        # ---- 1) Slider-Defaults und Clamping --------------------------------------
         eye_open   = float(np.clip(_nz(eye_open, 1.0),  0.0, 1.0))
         mouth_open = float(np.clip(_nz(mouth_open, 0.2), 0.0, 1.0))
 
         H, W = img.shape[:2]
         X, Y = _identity_grid(H, W)
 
-        # ---- 2) Polygone aus State oder MediaPipe --------------------------------
+        # Polygone beschaffen
         if (not polys_state) or any(k not in polys_state for k in ("left_eye", "right_eye", "lips")):
             if not _HAS_MP:
                 raise RuntimeError("MediaPipe FaceMesh nicht installiert. Bitte 'pip install mediapipe'.")
             rgb_for_mp = img if img.ndim == 3 else np.stack([img] * 3, axis=-1)
             polys_state = _mp_detect_face_regions(rgb_for_mp)
 
-        # ---- 3) RegionInfos (Masken + Falloff) -----------------------------------
+        # RegionInfos
         regions = [
             _build_region_info(H, W, "left_eye",  polys_state["left_eye"]),
             _build_region_info(H, W, "right_eye", polys_state["right_eye"]),
             _build_region_info(H, W, "lips",      polys_state["lips"]),
         ]
 
-        # ---- 4) adaptive Verstärkung je Region -----------------------------------
-        # Ziel: bei kleinen Regionen (kleine Bounding-Box) sichtbar verstärken.
-        # Wir skalieren die Verschiebung mit S = max(1, TARGET / region_height).
-        TARGET_EYE_PIX   = 26.0   # gewünschte "gefühlte" Halbhöhe für Augen (Tuning-Regler)
-        TARGET_MOUTH_PIX = 40.0   # für Lippen/Mund
-        EYE_STRENGTH_BASE   = 1.4 # exponentiell auf den Faktor
-        MOUTH_STRENGTH_BASE = 1.25
-
+        # Adaptive Verstärkung
         parts: list[tuple[np.ndarray, np.ndarray]] = []
-
         for R in regions:
-            # Regionhöhe aus Bounding Box
             x0, y0, x1, y1 = _region_bbox(R.poly)
             region_h = float(max(1, (y1 - y0)))
-
             if R.name in ("left_eye", "right_eye"):
-                # Faktor wie vorher – plus Verstärkung über die Regionsgröße
-                f = (0.15 + 0.85 * eye_open) ** EYE_STRENGTH_BASE
+                base = (0.15 + 0.85 * eye_open) ** EYE_STRENGTH_BASE
                 size_gain = max(1.0, TARGET_EYE_PIX / region_h)
-                # _warp_region_vertical nutzt dy = (f-1)*(Y-cy)*falloff → wir erhöhen effektiv (f-1) durch size_gain
-                f_eff = 1.0 + (f - 1.0) * size_gain
+                f_eff = 1.0 + (base - 1.0) * size_gain
                 parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
-
             elif R.name == "lips":
-                f = (1.0 + 0.8 * mouth_open) ** MOUTH_STRENGTH_BASE
+                base = (1.0 + 0.8 * mouth_open) ** MOUTH_STRENGTH_BASE
                 size_gain = max(1.0, TARGET_MOUTH_PIX / region_h)
-                f_eff = 1.0 + (f - 1.0) * size_gain
+                f_eff = 1.0 + (base - 1.0) * size_gain
                 parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
 
-        # ---- 5) Maps zusammensetzen ----------------------------------------------
+        # Maps
         map_x, map_y = _compose_maps(X, Y, parts)
-
-        # Sicherheit: keine NaNs/Inf, Clamp auf gültige Koordinaten
         map_x = np.nan_to_num(map_x, nan=0.0, posinf=W-1.0, neginf=0.0)
         map_y = np.nan_to_num(map_y, nan=0.0, posinf=H-1.0, neginf=0.0)
         np.clip(map_x, 0, W-1, out=map_x)
         np.clip(map_y, 0, H-1, out=map_y)
 
-        # ---- 6) Warpen (HALO wenn möglich, sonst OpenCV) --------------------------
+        # Remap (erzwinge OpenCV, da Pixelkoordinaten)
         dtype_info = _get_dtype_info(img)
         rgb_like = img if img.ndim == 3 else np.stack([img] * 3, axis=-1)
         img_f32 = _normalize_to_float32(rgb_like, dtype_info)
-
-        try:
-            warped = warp_custom(img_f32, map_x, map_y, interpolation="bilinear", cval=0.0)
-        except Exception:
+        if FORCE_OCV_REMAP:
             warped = _remap_bilinear(img_f32, map_x, map_y)
+        else:
+            try:
+                warped = warp_custom(img_f32, map_x, map_y, interpolation="bilinear", cval=0.0)
+            except Exception:
+                warped = _remap_bilinear(img_f32, map_x, map_y)
 
-        out = _denormalize_from_float32(warped, dtype_info)
-        return out
+        return _denormalize_from_float32(warped, dtype_info)
 
     except Exception as e:
         print(f"[process_face_anim_frame] Fehler: {e}")
@@ -703,16 +691,48 @@ def process_face_anim_sequence(img: np.ndarray, frames: int, fps: int, polys_sta
     img_rgb = img if img.ndim==3 else np.stack([img]*3, axis=-1)
     img_f32 = _normalize_to_float32(img_rgb, dtype_info)
 
+    def _region_bbox(poly: np.ndarray) -> tuple[int, int, int, int]:
+        if poly is None or len(poly) < 3:
+            return 0, 0, W-1, H-1
+        x0 = int(np.clip(np.min(poly[:,0]), 0, W-1))
+        x1 = int(np.clip(np.max(poly[:,0]), 0, W-1))
+        y0 = int(np.clip(np.min(poly[:,1]), 0, H-1))
+        y1 = int(np.clip(np.max(poly[:,1]), 0, H-1))
+        if x1 <= x0: x1 = min(x0+1, W-1)
+        if y1 <= y0: y1 = min(y0+1, H-1)
+        return x0, y0, x1, y1
+
     try:
         for i in range(frames):
-            parts=[]
+            parts = []
             for R in regions:
-                if R.name in ("left_eye","right_eye"):
-                    parts.append(_warp_region_vertical(X, Y, R, factor=(0.15 + 0.85*float(eye_curve[i]))))
+                # einfache Keyframes wie zuvor (du kannst hier auch Kurven nehmen)
+                if R.name in ("left_eye", "right_eye"):
+                    base = (0.15 + 0.85 * float(eye_curve[i])) ** EYE_STRENGTH_BASE
+                    x0, y0, x1, y1 = _region_bbox(R.poly)
+                    region_h = float(max(1, (y1 - y0)))
+                    size_gain = max(1.0, TARGET_EYE_PIX / region_h)
+                    f_eff = 1.0 + (base - 1.0) * size_gain
+                    parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
                 elif R.name == "lips":
-                    parts.append(_warp_region_vertical(X, Y, R, factor=(1.0 + 0.8*float(mouth_curve[i]))))
+                    base = (1.0 + 0.8 * float(mouth_curve[i])) ** MOUTH_STRENGTH_BASE
+                    x0, y0, x1, y1 = _region_bbox(R.poly)
+                    region_h = float(max(1, (y1 - y0)))
+                    size_gain = max(1.0, TARGET_MOUTH_PIX / region_h)
+                    f_eff = 1.0 + (base - 1.0) * size_gain
+                    parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
+
             map_x, map_y = _compose_maps(X, Y, parts)
-            warped = warp_custom(img_f32, map_x, map_y, interpolation="bilinear", cval=0.0)
+            map_x = np.clip(np.nan_to_num(map_x, nan=0.0, posinf=W-1.0, neginf=0.0), 0, W-1)
+            map_y = np.clip(np.nan_to_num(map_y, nan=0.0, posinf=H-1.0, neginf=0.0), 0, H-1)
+
+            if FORCE_OCV_REMAP:
+                warped = _remap_bilinear(img_f32, map_x, map_y)
+            else:
+                try:
+                    warped = warp_custom(img_f32, map_x, map_y, interpolation="bilinear", cval=0.0)
+                except Exception:
+                    warped = _remap_bilinear(img_f32, map_x, map_y)
             frame = _denormalize_from_float32(warped, dtype_info).astype(np.uint8, copy=False)
             if frame.ndim == 2:
                 frame = np.stack([frame]*3, axis=-1)
