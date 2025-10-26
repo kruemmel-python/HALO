@@ -546,8 +546,8 @@ def _remap_bilinear(img_f32: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -
     """
     H, W = img_f32.shape[:2]
     # cv2.remap erwartet (W,H,2) float32 oder getrennte map_x,map_y float32
-    mx = map_x.astype(np.float32, copy=False)
-    my = map_y.astype(np.float32, copy=False)
+    mx = np.ascontiguousarray(map_x, dtype=np.float32)
+    my = np.ascontiguousarray(map_y, dtype=np.float32)
     if img_f32.ndim == 2:
         img_f32 = img_f32[..., None]
     out_ch = []
@@ -608,34 +608,48 @@ def process_face_anim_frame(
             _build_region_info(H, W, "lips",      polys_state["lips"]),
         ]
 
-        # Adaptive Verstärkung
-        parts: list[tuple[np.ndarray, np.ndarray]] = []
+        # Adaptive Verstärkung → direkt in die Map addieren
+        map_x = X.copy()
+        map_y = Y.copy()
+        modified = False
+
         for R in regions:
             x0, y0, x1, y1 = _region_bbox(R.poly)
             region_h = float(max(1, (y1 - y0)))
             if R.name in ("left_eye", "right_eye"):
                 base = (0.15 + 0.85 * eye_open) ** EYE_STRENGTH_BASE
                 size_gain = max(1.0, TARGET_EYE_PIX / region_h)
-                f_eff = 1.0 + (base - 1.0) * size_gain
-                parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
             elif R.name == "lips":
                 base = (1.0 + 0.8 * mouth_open) ** MOUTH_STRENGTH_BASE
                 size_gain = max(1.0, TARGET_MOUTH_PIX / region_h)
-                f_eff = 1.0 + (base - 1.0) * size_gain
-                parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
+            else:
+                continue
 
-        # Maps
-        map_x, map_y = _compose_maps(X, Y, parts)
+            f_eff = 1.0 + (base - 1.0) * size_gain
+            f_eff = float(np.clip(f_eff, 0.05, 6.0))
+            if abs(f_eff - 1.0) < 1e-3:
+                continue
+
+            _, warped_y = _warp_region_vertical(X, Y, R, factor=f_eff)
+            map_y += (warped_y - Y)
+            modified = True
+
+        if not modified:
+            return img
+
         map_x = np.nan_to_num(map_x, nan=0.0, posinf=W-1.0, neginf=0.0)
         map_y = np.nan_to_num(map_y, nan=0.0, posinf=H-1.0, neginf=0.0)
-        np.clip(map_x, 0, W-1, out=map_x)
-        np.clip(map_y, 0, H-1, out=map_y)
+        map_x = np.clip(map_x, 0, W-1, out=map_x)
+        map_y = np.clip(map_y, 0, H-1, out=map_y)
 
         # Remap (erzwinge OpenCV, da Pixelkoordinaten)
         dtype_info = _get_dtype_info(img)
         rgb_like = img if img.ndim == 3 else np.stack([img] * 3, axis=-1)
         img_f32 = _normalize_to_float32(rgb_like, dtype_info)
         warped = _remap_bilinear(img_f32, map_x, map_y)
+
+        if img.ndim == 2 and warped.ndim == 3 and warped.shape[2] == 1:
+            warped = warped[..., 0]
 
         return _denormalize_from_float32(warped, dtype_info)
 
@@ -698,30 +712,40 @@ def process_face_anim_sequence(img: np.ndarray, frames: int, fps: int, polys_sta
 
     try:
         for i in range(frames):
-            parts = []
+            map_x = X.copy()
+            map_y = Y.copy()
+            modified = False
+
             for R in regions:
-                # einfache Keyframes wie zuvor (du kannst hier auch Kurven nehmen)
                 if R.name in ("left_eye", "right_eye"):
                     base = (0.15 + 0.85 * float(eye_curve[i])) ** EYE_STRENGTH_BASE
-                    x0, y0, x1, y1 = _region_bbox(R.poly)
-                    region_h = float(max(1, (y1 - y0)))
-                    size_gain = max(1.0, TARGET_EYE_PIX / region_h)
-                    f_eff = 1.0 + (base - 1.0) * size_gain
-                    parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
+                    target = TARGET_EYE_PIX
                 elif R.name == "lips":
                     base = (1.0 + 0.8 * float(mouth_curve[i])) ** MOUTH_STRENGTH_BASE
-                    x0, y0, x1, y1 = _region_bbox(R.poly)
-                    region_h = float(max(1, (y1 - y0)))
-                    size_gain = max(1.0, TARGET_MOUTH_PIX / region_h)
-                    f_eff = 1.0 + (base - 1.0) * size_gain
-                    parts.append(_warp_region_vertical(X, Y, R, factor=f_eff))
+                    target = TARGET_MOUTH_PIX
+                else:
+                    continue
 
-            map_x, map_y = _compose_maps(X, Y, parts)
-            map_x = np.clip(np.nan_to_num(map_x, nan=0.0, posinf=W-1.0, neginf=0.0), 0, W-1)
-            map_y = np.clip(np.nan_to_num(map_y, nan=0.0, posinf=H-1.0, neginf=0.0), 0, H-1)
+                x0, y0, x1, y1 = _region_bbox(R.poly)
+                region_h = float(max(1, (y1 - y0)))
+                size_gain = max(1.0, target / region_h)
+                f_eff = 1.0 + (base - 1.0) * size_gain
+                f_eff = float(np.clip(f_eff, 0.05, 6.0))
+                if abs(f_eff - 1.0) < 1e-3:
+                    continue
 
-            warped = _remap_bilinear(img_f32, map_x, map_y)
-            frame = _denormalize_from_float32(warped, dtype_info).astype(np.uint8, copy=False)
+                _, warped_y = _warp_region_vertical(X, Y, R, factor=f_eff)
+                map_y += (warped_y - Y)
+                modified = True
+
+            if not modified:
+                frame = _denormalize_from_float32(img_f32, dtype_info).astype(np.uint8, copy=False)
+            else:
+                map_x = np.clip(np.nan_to_num(map_x, nan=0.0, posinf=W-1.0, neginf=0.0), 0, W-1)
+                map_y = np.clip(np.nan_to_num(map_y, nan=0.0, posinf=H-1.0, neginf=0.0), 0, H-1)
+                warped = _remap_bilinear(img_f32, map_x, map_y)
+                frame = _denormalize_from_float32(warped, dtype_info).astype(np.uint8, copy=False)
+
             if frame.ndim == 2:
                 frame = np.stack([frame]*3, axis=-1)
             writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
