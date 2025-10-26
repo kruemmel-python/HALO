@@ -635,13 +635,7 @@ def process_face_anim_frame(
         dtype_info = _get_dtype_info(img)
         rgb_like = img if img.ndim == 3 else np.stack([img] * 3, axis=-1)
         img_f32 = _normalize_to_float32(rgb_like, dtype_info)
-        if FORCE_OCV_REMAP:
-            warped = _remap_bilinear(img_f32, map_x, map_y)
-        else:
-            try:
-                warped = warp_custom(img_f32, map_x, map_y, interpolation="bilinear", cval=0.0)
-            except Exception:
-                warped = _remap_bilinear(img_f32, map_x, map_y)
+        warped = _remap_bilinear(img_f32, map_x, map_y)
 
         return _denormalize_from_float32(warped, dtype_info)
 
@@ -726,13 +720,7 @@ def process_face_anim_sequence(img: np.ndarray, frames: int, fps: int, polys_sta
             map_x = np.clip(np.nan_to_num(map_x, nan=0.0, posinf=W-1.0, neginf=0.0), 0, W-1)
             map_y = np.clip(np.nan_to_num(map_y, nan=0.0, posinf=H-1.0, neginf=0.0), 0, H-1)
 
-            if FORCE_OCV_REMAP:
-                warped = _remap_bilinear(img_f32, map_x, map_y)
-            else:
-                try:
-                    warped = warp_custom(img_f32, map_x, map_y, interpolation="bilinear", cval=0.0)
-                except Exception:
-                    warped = _remap_bilinear(img_f32, map_x, map_y)
+            warped = _remap_bilinear(img_f32, map_x, map_y)
             frame = _denormalize_from_float32(warped, dtype_info).astype(np.uint8, copy=False)
             if frame.ndim == 2:
                 frame = np.stack([frame]*3, axis=-1)
